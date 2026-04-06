@@ -1,0 +1,36 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+
+# Keil user settings
+MDK-ARM/*.uvoptx
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.bak
+
+# Keil / EIDE build outputs
+MDK-ARM/build/
+MDK-ARM/SepFOC_Loop/
+MDK-ARM/DebugConfig/
+
+# Generic build artifacts
+*.o
+*.obj
+*.d
+*.crf
+*.dep
+*.map
+*.htm
+*.hex
+*.bin
+*.elf
+*.axf
+*.s19
+*.lst
+*.lnp
+*.log
+
+# Temporary files
+*.tmp
+*.temp
