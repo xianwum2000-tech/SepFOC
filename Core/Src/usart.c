@@ -273,12 +273,14 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                 else if(ch == '\r' || ch == '\n') {
                     if(buf_idx > 0) {
                         long mode_val = 0;
+                        SepFocControlMode new_mode = SEP_FOC_MODE_DISABLED;
                         temp_buf[buf_idx] = '\0';
                         mode_val = strtol((char*)temp_buf, NULL, 10);
                         if((mode_val >= 0) && (mode_val < (long)SEP_FOC_MODE_COUNT)) {
-                            // 切模式时将目标值清零，避免把上一模式的目标量直接带入新模式
-                            motor_target_val = 0.0f;
-                            Sep_FOC_SetControlMode((SepFocControlMode)mode_val);
+                            new_mode = (SepFocControlMode)mode_val;
+                            // 位置类模式默认锁当前位置，其余模式默认目标清零，避免切换瞬间误动作
+                            motor_target_val = Sep_FOC_GetModeHoldTarget(new_mode);
+                            Sep_FOC_SetControlMode(new_mode);
                             Vofa_PrintModeSwitchOk((uint32_t)mode_val);
                         }
                         else {

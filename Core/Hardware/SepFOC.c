@@ -13,36 +13,143 @@
 
 FOC_data FOC;
 
-// 控制框架运行时变量：
-// 这里集中保存当前模式、各环目标值、各环输出值以及 PID/PI 状态，
-// 方便后面继续扩展位置-速度-电流串级控制或运行时切换模式。
-static volatile SepFocControlMode foc_control_mode = SEP_FOC_STARTUP_MODE;
-static volatile float foc_applied_uq = 0.0f;
-static volatile float voltage_torque_target = 0.0f;
-static volatile float position_target_angle = 0.0f;
-static volatile float position_output_uq = 0.0f;
-static volatile float speed_target = 0.0f;
-static volatile float torque_target_q = 0.0f;
-static volatile float torque_measured_q = 0.0f;
-static volatile float torque_output_uq = 0.0f;
+/**********************************************************************************************
+ * @brief  控制框架运行时变量
+ * @note   这里把“对外调试常看量”和“各环内部参数/状态量”分开摆放。
+ *         平时调试串口、VOFA 或切模式时，优先看最前面的对外观测区；
+ *         真正需要改环路手感时，再往下看各环参数区。
+ *********************************************************************************************/
 
-static float speed_loop_kp = 0.01f;          // 保持原来的速度环参数
+/* ============================== 对外观测与模式状态区 ============================== */
+/* 这一组变量会被 getter、调试打印或模式切换逻辑直接使用，后面看现象时优先关注这里。 */
+static volatile SepFocControlMode foc_control_mode = SEP_FOC_STARTUP_MODE;  // 当前控制模式
+static volatile float foc_applied_uq = 0.0f;                                // 当前真正施加到电机上的 Uq
+
+static volatile float voltage_torque_target = 0.0f;                         // 电压力矩模式目标 Uq
+
+static volatile float position_target_angle = 0.0f;                         // 位置类模式目标绝对角度，单位度
+static volatile float position_output_uq = 0.0f;                            // 纯位置环当前直接输出的 Uq
+
+static volatile float speed_target = 0.0f;                                  // 纯速度环目标速度，单位 rad/s
+static volatile float speed_loop_output = 0.0f;                             // 速度环当前输出的 Uq
+
+static volatile float posvel_speed_target = 0.0f;                           // 串级模式外环给出的速度目标，单位 rad/s
+static volatile float spcur_speed_target = 0.0f;                            // 速度-电流串级目标速度，单位 rad/s
+static volatile float spcur_current_target_q = 0.0f;                        // 速度-电流串级外环给出的目标电流，单位 A
+static volatile float posvcur_speed_target = 0.0f;                          // 三环模式最外环给出的速度目标，单位 rad/s
+static volatile float posvcur_current_target_q = 0.0f;                      // 三环模式中间速度环给出的目标电流，单位 A
+
+static volatile float poscur_current_target_q = 0.0f;                       // 位置-电流串级最终目标电流，单位 A
+static volatile float poscur_pid_target_q = 0.0f;                           // 位置-电流串级外环 PID 基础输出电流，单位 A
+static volatile float poscur_startup_comp_q = 0.0f;                         // 启动力矩补偿电流，单位 A
+static volatile float poscur_damping_comp_q = 0.0f;                         // 速度阻尼补偿电流，单位 A
+static volatile float poscur_min_comp_q = 0.0f;                             // 最小力矩补偿电流，单位 A
+
+static volatile float torque_target_q = 0.0f;                               // 电流环目标 Q 轴电流，单位 A
+static volatile float torque_measured_q = 0.0f;                             // 电流环实测 Q 轴电流，单位 A
+static volatile float torque_output_uq = 0.0f;                              // 电流环输出的 Uq
+
+/* ================================ 纯位置环参数区 ================================ */
+/* 纯位置环是“角度误差直接出 Uq”的单环控制，这里调的是硬不硬、跟不跟手。 */
+static float position_loop_kp = 0.05f;
+static float position_loop_ki = 0.05f;
+static float position_loop_kd = 0.05f;
+static float position_loop_output_limit = 5.0f;
+
+/* 纯位置环内部状态：主要用于积分与微分计算，通常调参时不用直接改。 */
+static float angle_error_integral = 0.0f;
+static float last_angle_error = 0.0f;
+
+/* ================================ 纯速度环参数区 ================================ */
+/* 纯速度环沿用你之前已经调过的那套参数，这里主要决定起转速度和稳速手感。 */
+static float speed_loop_kp = 0.01f;
 static float speed_loop_ki = 0.008f;
 static float speed_loop_kd = 0.008f;
+static float speed_loop_output_limit = 10.0f;
+
+/* 纯速度环内部状态：增量式 PID 计算缓存。 */
 static float speed_loop_error = 0.0f;
 static float speed_loop_last_error = 0.0f;
 static float speed_loop_prev_error = 0.0f;
-static float speed_loop_output = 0.0f;
-static float speed_loop_output_limit = 10.0f;
 
-static float current_loop_kp = 0.8f;         // 单独给电流环一套参数
+/* ================================ 电流环参数区 ================================= */
+/* 电流环目前是单 q 轴 PI，用来把目标 Iq 拉到位。 */
+static float current_loop_kp = 0.8f;
 static float current_loop_ki = 0.005f;
+
+/* 电流环内部状态：这里只保留积分项。 */
 static float current_loop_integral = 0.0f;
 
-static float angle_error_integral = 0.0f;    // 位置环积分项
-static float last_angle_error = 0.0f;        // 位置环上次误差
+/* ============================ 位置-速度串级外环参数区 ============================ */
+/* 这组参数决定“位置误差转换成速度目标”的力度。
+ * 调串级模式时，优先看/调的就是这里，尤其是 Kp、Ki、Kd 和 speed_limit。 */
+static float posvel_position_kp = 30.0f;
+static float posvel_position_ki = 0.1f;
+static float posvel_position_kd = 0.05f;
+static float posvel_speed_limit = 20.0f;
+
+/* 串级外环内部状态：外环积分、微分缓存，以及外环执行分频计数。 */
+static float posvel_angle_error_integral = 0.0f;
+static float posvel_last_angle_error = 0.0f;
+static uint8_t posvel_outer_div_counter = 0U;
+
+/* ============================ 速度-电流串级外环参数区 ============================ */
+/* 这组参数把速度误差转换成目标电流，适合在“要速度、也要力矩感”的场景下使用。
+ * 调这套环时，优先关注目标电流是否经常打满，再决定是改 Kp/Ki/Kd 还是改 current_limit。 */
+static float spcur_speed_kp = 0.03f;
+static float spcur_speed_ki = 0.20f;
+static float spcur_speed_kd = 0.0f;
+static float spcur_current_limit = 0.8f;
+
+/* 速度-电流串级外环内部状态：速度积分与微分缓存。 */
+static float spcur_speed_error_integral = 0.0f;
+static float spcur_last_speed_error = 0.0f;
+
+/* ======================= 位置-速度-电流三环参数与状态区 ======================== */
+/* 这是最完整的三环控制：位置环出速度目标，速度环出电流目标，最后交给电流 PI 出 Uq。
+ * 调参时建议严格按“位置外环 -> 速度中环 -> 电流内环”的顺序来，不要三层一起动。 */
+static float posvcur_position_kp = 30.0f;
+static float posvcur_position_ki = 0.0f;
+static float posvcur_position_kd = 0.05f;
+static float posvcur_speed_limit = 20.0f;
+static float posvcur_hold_angle_deadband_deg = 0.05f;
+static float posvcur_hold_speed_deadband = 0.05f;
+
+static float posvcur_speed_kp = 0.03f;
+static float posvcur_speed_ki = 0.20f;
+static float posvcur_speed_kd = 0.0f;
+static float posvcur_current_limit = 0.8f;
+
+/* 三环模式内部状态：位置外环按分频执行，速度中环每次慢环执行，电流内环仍走 ADC 快环。 */
+static float posvcur_angle_error_integral = 0.0f;
+static float posvcur_last_angle_error = 0.0f;
+static float posvcur_speed_error_integral = 0.0f;
+static float posvcur_last_speed_error = 0.0f;
+static uint8_t posvcur_outer_div_counter = 0U;
+
+/* ============================ 位置-电流串级外环参数区 ============================ */
+/* 这组参数把位置误差转换成目标电流，适合做“有力、能扛负载”的位置控制。
+ * 这里额外引入启动力矩补偿、速度阻尼和最小力矩补偿，用来对抗静摩擦和低速发软。 */
+static float poscur_position_kp = 0.8f;
+static float poscur_position_ki = 0.0f;
+static float poscur_position_kd = 0.02f;
+static float poscur_current_limit = 0.8f;
+static float poscur_startup_boost_q = 0.18f;
+static float poscur_startup_error_threshold_deg = 3.0f;
+static float poscur_startup_speed_threshold = 0.5f;
+static float poscur_damping_gain = 0.02f;
+static float poscur_min_torque_comp_q = 0.08f;
+static float poscur_min_comp_error_threshold_deg = 1.0f;
+
+/* 位置-电流串级外环内部状态：位置积分、微分缓存。
+ * 内环电流 PI 继续复用 current_loop_*，这里只保存外环位置侧状态。 */
+static float poscur_angle_error_integral = 0.0f;
+static float poscur_last_angle_error = 0.0f;
 
 static void Sep_FOC_ResetLoopStates(void);
+static float Sep_FOC_NormalizeDegreeTarget(float target_deg);
+static uint8_t Sep_FOC_GetPosVelOuterRatio(void);
+static uint8_t Sep_FOC_GetPosVCurOuterRatio(void);
 
 
 // 启动PWM输出 *******************************************************************************************
@@ -289,6 +396,76 @@ float low_pass_filter(float input, float last_output, float alpha)
 }
 
 
+/**********************************************************************************************
+ * @brief  将角度目标统一折算到 0~360 度范围内
+ * @param  target_deg: 任意输入角度，单位度
+ * @return 归一化后的单圈绝对角度
+ *********************************************************************************************/
+static float Sep_FOC_NormalizeDegreeTarget(float target_deg)
+{
+    target_deg = fmodf(target_deg, 360.0f);
+    if (target_deg < 0.0f)
+    {
+        target_deg += 360.0f;
+    }
+    return target_deg;
+}
+
+/**********************************************************************************************
+ * @brief  计算串级模式中外环相对内环的执行倍率
+ * @return 外环每隔多少次内环执行一次，最小返回 1
+ * @note   推荐将 SEP_FOC_POSVEL_OUTER_DIV 设为 SEP_FOC_POSVEL_INNER_DIV 的整数倍。
+ *         如果不是整数倍，这里会向上取整，保证外环频率不会高于内环。
+ *********************************************************************************************/
+static uint8_t Sep_FOC_GetPosVelOuterRatio(void)
+{
+    uint8_t ratio = 1U;
+
+    if (SEP_FOC_POSVEL_INNER_DIV == 0U)
+    {
+        return 1U;
+    }
+
+    if (SEP_FOC_POSVEL_OUTER_DIV > SEP_FOC_POSVEL_INNER_DIV)
+    {
+        ratio = (uint8_t)(SEP_FOC_POSVEL_OUTER_DIV / SEP_FOC_POSVEL_INNER_DIV);
+        if ((SEP_FOC_POSVEL_OUTER_DIV % SEP_FOC_POSVEL_INNER_DIV) != 0U)
+        {
+            ratio++;
+        }
+    }
+
+    return (ratio == 0U) ? 1U : ratio;
+}
+
+/**********************************************************************************************
+ * @brief  计算三环模式中位置外环相对速度中环的执行倍率
+ * @return 最外层位置环每隔多少次速度环执行一次，最小返回 1
+ * @note   推荐将 SEP_FOC_POSVCUR_POSITION_DIV 设为 SEP_FOC_POSVCUR_SPEED_DIV 的整数倍。
+ *         如果不是整数倍，这里会向上取整，保证最外环频率不会高于中间速度环。
+ *********************************************************************************************/
+static uint8_t Sep_FOC_GetPosVCurOuterRatio(void)
+{
+    uint8_t ratio = 1U;
+
+    if (SEP_FOC_POSVCUR_SPEED_DIV == 0U)
+    {
+        return 1U;
+    }
+
+    if (SEP_FOC_POSVCUR_POSITION_DIV > SEP_FOC_POSVCUR_SPEED_DIV)
+    {
+        ratio = (uint8_t)(SEP_FOC_POSVCUR_POSITION_DIV / SEP_FOC_POSVCUR_SPEED_DIV);
+        if ((SEP_FOC_POSVCUR_POSITION_DIV % SEP_FOC_POSVCUR_SPEED_DIV) != 0U)
+        {
+            ratio++;
+        }
+    }
+
+    return (ratio == 0U) ? 1U : ratio;
+}
+
+
 
 // 定义时直接计算好
 const float _elec_gain = (float)DIR * (float)POLE_PAIRS;
@@ -410,24 +587,12 @@ void Sep_FOC_M0_setTorque(float Target)
  * @brief 纯位置闭环控制 (力位控制)
  * @param Target: 目标绝对角度 (单位: 度，范围 0~360)
  */
-
 void Sep_FOC_M0_set_Force_Angle(float Target)
 {
-	// --- 这里的参数是让它变“硬”的关键 ---
-    float Kp = 0.05f;    // 显著增大！15.0 意味着偏离 1 rad 输出 15A/V 的力矩
-    float Ki = 0.05f;     // 增大！消除静态偏差，让你掰不动
-    float Kd = 0.05f;     // 增大！配合 Kp 防止乱抖
-    float Max_Torque = 5.0f; // 这里的数值取决于你的驱动器能承受的最大电流/电压
-
     // 1. 将目标和反馈统一转换到单圈绝对角度，位置误差取最短路径
-    float target_angle_deg = fmodf(Target, 360.0f);
+    float target_angle_deg = Sep_FOC_NormalizeDegreeTarget(Target);
     float current_angle_deg = Get_Angle();
     float error = 0.0f;
-
-    if (target_angle_deg < 0.0f)
-    {
-        target_angle_deg += 360.0f;
-    }
 
     error = cycle_diff(target_angle_deg - current_angle_deg, 360.0f);
 
@@ -442,11 +607,13 @@ void Sep_FOC_M0_set_Force_Angle(float Target)
     last_angle_error = error;
 
     // 4. PID 总输出
-    float output_torque = (Kp * error) + (Ki * angle_error_integral) + (Kd * d_error);
+    float output_torque = (position_loop_kp * error) +
+                          (position_loop_ki * angle_error_integral) +
+                          (position_loop_kd * d_error);
 
     // 5. 输出限幅 (非常重要！没有这个可能会烧管子或者手被打疼)
-    if(output_torque > Max_Torque)  output_torque = Max_Torque;
-    if(output_torque < -Max_Torque) output_torque = -Max_Torque;
+    if(output_torque > position_loop_output_limit)  output_torque = position_loop_output_limit;
+    if(output_torque < -position_loop_output_limit) output_torque = -position_loop_output_limit;
 
     position_target_angle = target_angle_deg;
     position_output_uq = output_torque;
@@ -485,6 +652,336 @@ void Sep_FOC_M0_setVelocity(float Target)
 
     // 执行力矩输出（电流环/占空比映射）
     setTorque(speed_loop_output, _electricalAngle()); 
+}
+
+/**********************************************************************************************
+ * @brief  速度-电流串级闭环控制
+ * @param  Target: 目标速度，单位 rad/s
+ * @note   外环速度 PID 输出目标 Iq，内环复用现有电流 PI 输出 Uq。
+ *         这层只更新目标电流，不直接写 PWM，真正的电流控制放在 ADC 快环里。
+ *********************************************************************************************/
+void Sep_FOC_M0_set_VelocityCurrent(float Target)
+{
+    float error = Target - motor_speed;
+    float dt = (float)SEP_FOC_SPCUR_OUTER_DIV / (float)SPEED_CALCU_FREQ;
+    float derivative = 0.0f;
+    float p_term = 0.0f;
+    float i_term = 0.0f;
+    float d_term = 0.0f;
+    float integral_candidate = 0.0f;
+    float iq_cmd_unsat = 0.0f;
+    float iq_cmd = 0.0f;
+
+    if (dt <= 0.0f)
+    {
+        dt = 1.0f / (float)SPEED_CALCU_FREQ;
+    }
+
+    derivative = (error - spcur_last_speed_error) / dt;
+    p_term = spcur_speed_kp * error;
+    d_term = spcur_speed_kd * derivative;
+    integral_candidate = spcur_speed_error_integral + error * dt;
+
+    if (spcur_speed_ki > 0.0f)
+    {
+        float integral_limit = spcur_current_limit / spcur_speed_ki;
+        integral_candidate = _constrain(integral_candidate, -integral_limit, integral_limit);
+        iq_cmd_unsat = p_term + (spcur_speed_ki * integral_candidate) + d_term;
+
+        // 条件积分：未饱和时正常积；已饱和时，只保留能把输出拉回线性区的积分项。
+        if (((iq_cmd_unsat < spcur_current_limit) && (iq_cmd_unsat > -spcur_current_limit)) ||
+            ((iq_cmd_unsat >= spcur_current_limit) && (error < 0.0f)) ||
+            ((iq_cmd_unsat <= -spcur_current_limit) && (error > 0.0f)))
+        {
+            spcur_speed_error_integral = integral_candidate;
+        }
+    }
+
+    i_term = spcur_speed_ki * spcur_speed_error_integral;
+    iq_cmd = p_term + i_term + d_term;
+    iq_cmd = _constrain(iq_cmd, -spcur_current_limit, spcur_current_limit);
+
+    spcur_speed_target = Target;
+    spcur_current_target_q = iq_cmd;
+    spcur_last_speed_error = error;
+}
+
+/**********************************************************************************************
+ * @brief  位置-速度-电流三环闭环控制
+ * @param  Target: 目标绝对角度，单位度，范围 0~360
+ * @note   最外环位置 PID 输出速度目标，中间速度 PID 输出目标 Iq，
+ *         最内环继续复用现有电流 PI 输出 Uq，是当前框架下最完整的三环控制。
+ *********************************************************************************************/
+void Sep_FOC_M0_set_PositionVelocityCurrent(float Target)
+{
+    float target_angle_deg = Sep_FOC_NormalizeDegreeTarget(Target);
+    float current_angle_deg = Get_Angle();
+    float error_deg = cycle_diff(target_angle_deg - current_angle_deg, 360.0f);
+    float error_rad = deg2rad(error_deg);
+    uint8_t outer_ratio = Sep_FOC_GetPosVCurOuterRatio();
+
+    // 静止保持死区：到位且速度已经很小后，直接把中间层和内层目标清零，
+    // 避免编码器量化与速度差分噪声在目标点附近不断来回找点。
+    if ((fabsf(error_deg) <= posvcur_hold_angle_deadband_deg) &&
+        (fabsf(motor_speed) <= posvcur_hold_speed_deadband))
+    {
+        position_target_angle = target_angle_deg;
+        posvcur_speed_target = 0.0f;
+        posvcur_current_target_q = 0.0f;
+        posvcur_angle_error_integral = 0.0f;
+        posvcur_speed_error_integral = 0.0f;
+        posvcur_last_angle_error = error_rad;
+        posvcur_last_speed_error = -motor_speed;
+        posvcur_outer_div_counter = 0U;
+        return;
+    }
+
+    if (posvcur_outer_div_counter == 0U)
+    {
+        float dt_pos = (float)SEP_FOC_POSVCUR_POSITION_DIV / (float)SPEED_CALCU_FREQ;
+        float derivative = 0.0f;
+        float p_term = 0.0f;
+        float i_term = 0.0f;
+        float d_term = 0.0f;
+        float integral_candidate = 0.0f;
+        float speed_cmd_unsat = 0.0f;
+        float speed_cmd = 0.0f;
+
+        if (dt_pos <= 0.0f)
+        {
+            dt_pos = 1.0f / (float)SPEED_CALCU_FREQ;
+        }
+
+        derivative = (error_rad - posvcur_last_angle_error) / dt_pos;
+        p_term = posvcur_position_kp * error_rad;
+        d_term = posvcur_position_kd * derivative;
+        integral_candidate = posvcur_angle_error_integral + error_rad * dt_pos;
+
+        if (posvcur_position_ki > 0.0f)
+        {
+            float integral_limit = posvcur_speed_limit / posvcur_position_ki;
+            integral_candidate = _constrain(integral_candidate, -integral_limit, integral_limit);
+            speed_cmd_unsat = p_term + (posvcur_position_ki * integral_candidate) + d_term;
+
+            if (((speed_cmd_unsat < posvcur_speed_limit) && (speed_cmd_unsat > -posvcur_speed_limit)) ||
+                ((speed_cmd_unsat >= posvcur_speed_limit) && (error_rad < 0.0f)) ||
+                ((speed_cmd_unsat <= -posvcur_speed_limit) && (error_rad > 0.0f)))
+            {
+                posvcur_angle_error_integral = integral_candidate;
+            }
+        }
+
+        i_term = posvcur_position_ki * posvcur_angle_error_integral;
+        speed_cmd = p_term + i_term + d_term;
+        speed_cmd = _constrain(speed_cmd, -posvcur_speed_limit, posvcur_speed_limit);
+
+        position_target_angle = target_angle_deg;
+        posvcur_speed_target = speed_cmd;
+        posvcur_last_angle_error = error_rad;
+    }
+
+    posvcur_outer_div_counter++;
+    if (posvcur_outer_div_counter >= outer_ratio)
+    {
+        posvcur_outer_div_counter = 0U;
+    }
+
+    {
+        float error = posvcur_speed_target - motor_speed;
+        float dt_speed = (float)SEP_FOC_POSVCUR_SPEED_DIV / (float)SPEED_CALCU_FREQ;
+        float derivative = 0.0f;
+        float p_term = 0.0f;
+        float i_term = 0.0f;
+        float d_term = 0.0f;
+        float integral_candidate = 0.0f;
+        float iq_cmd_unsat = 0.0f;
+        float iq_cmd = 0.0f;
+
+        if (dt_speed <= 0.0f)
+        {
+            dt_speed = 1.0f / (float)SPEED_CALCU_FREQ;
+        }
+
+        derivative = (error - posvcur_last_speed_error) / dt_speed;
+        p_term = posvcur_speed_kp * error;
+        d_term = posvcur_speed_kd * derivative;
+        integral_candidate = posvcur_speed_error_integral + error * dt_speed;
+
+        if (posvcur_speed_ki > 0.0f)
+        {
+            float integral_limit = posvcur_current_limit / posvcur_speed_ki;
+            integral_candidate = _constrain(integral_candidate, -integral_limit, integral_limit);
+            iq_cmd_unsat = p_term + (posvcur_speed_ki * integral_candidate) + d_term;
+
+            if (((iq_cmd_unsat < posvcur_current_limit) && (iq_cmd_unsat > -posvcur_current_limit)) ||
+                ((iq_cmd_unsat >= posvcur_current_limit) && (error < 0.0f)) ||
+                ((iq_cmd_unsat <= -posvcur_current_limit) && (error > 0.0f)))
+            {
+                posvcur_speed_error_integral = integral_candidate;
+            }
+        }
+
+        i_term = posvcur_speed_ki * posvcur_speed_error_integral;
+        iq_cmd = p_term + i_term + d_term;
+        iq_cmd = _constrain(iq_cmd, -posvcur_current_limit, posvcur_current_limit);
+
+        posvcur_current_target_q = iq_cmd;
+        posvcur_last_speed_error = error;
+    }
+}
+
+/**********************************************************************************************
+ * @brief  位置-速度串级闭环控制
+ * @param  Target: 目标绝对角度，单位度，范围 0~360
+ * @note   外环位置 PID 输出速度目标，内环复用现有速度环输出 Uq。
+ *         建议外环频率低于或等于内环频率，并使用配置宏单独调节。
+ *********************************************************************************************/
+void Sep_FOC_M0_set_PositionVelocity(float Target)
+{
+    float target_angle_deg = Sep_FOC_NormalizeDegreeTarget(Target);
+    uint8_t outer_ratio = Sep_FOC_GetPosVelOuterRatio();
+
+    if (posvel_outer_div_counter == 0U)
+    {
+        float current_angle_deg = Get_Angle();
+        float error_deg = cycle_diff(target_angle_deg - current_angle_deg, 360.0f);
+        float error_rad = deg2rad(error_deg);
+        float dt = (float)SEP_FOC_POSVEL_OUTER_DIV / (float)SPEED_CALCU_FREQ;
+        float derivative = 0.0f;
+        float p_term = 0.0f;
+        float i_term = 0.0f;
+        float d_term = 0.0f;
+        float integral_candidate = 0.0f;
+        float speed_cmd_unsat = 0.0f;
+        float speed_cmd = 0.0f;
+
+        if (dt <= 0.0f)
+        {
+            dt = 1.0f / (float)SPEED_CALCU_FREQ;
+        }
+
+        derivative = (error_rad - posvel_last_angle_error) / dt;
+        p_term = posvel_position_kp * error_rad;
+        d_term = posvel_position_kd * derivative;
+        integral_candidate = posvel_angle_error_integral + error_rad * dt;
+
+        if (posvel_position_ki > 0.0f)
+        {
+            float integral_limit = posvel_speed_limit / posvel_position_ki;
+            integral_candidate = _constrain(integral_candidate, -integral_limit, integral_limit);
+            speed_cmd_unsat = p_term + (posvel_position_ki * integral_candidate) + d_term;
+
+            // 条件积分：只有在未饱和，或积分有助于把输出从饱和区拉回时，才更新积分。
+            if (((speed_cmd_unsat < posvel_speed_limit) && (speed_cmd_unsat > -posvel_speed_limit)) ||
+                ((speed_cmd_unsat >= posvel_speed_limit) && (error_rad < 0.0f)) ||
+                ((speed_cmd_unsat <= -posvel_speed_limit) && (error_rad > 0.0f)))
+            {
+                posvel_angle_error_integral = integral_candidate;
+            }
+        }
+
+        i_term = posvel_position_ki * posvel_angle_error_integral;
+        speed_cmd = p_term + i_term + d_term;
+        speed_cmd = _constrain(speed_cmd, -posvel_speed_limit, posvel_speed_limit);
+
+        posvel_last_angle_error = error_rad;
+        position_target_angle = target_angle_deg;
+        posvel_speed_target = speed_cmd;
+    }
+
+    posvel_outer_div_counter++;
+    if (posvel_outer_div_counter >= outer_ratio)
+    {
+        posvel_outer_div_counter = 0U;
+    }
+
+    Sep_FOC_M0_setVelocity(posvel_speed_target);
+}
+
+/**********************************************************************************************
+ * @brief  位置-电流串级闭环控制
+ * @param  Target: 目标绝对角度，单位度，范围 0~360
+ * @note   外环位置 PID 输出目标 Iq，内环复用电流 PI 输出 Uq。
+ *         这里额外叠加了启动力矩补偿、速度阻尼和最小力矩补偿，优先解决低速发软、
+ *         静摩擦起不来以及接近目标时容易“推不动”的问题。
+ *********************************************************************************************/
+void Sep_FOC_M0_set_PositionCurrent(float Target)
+{
+    float target_angle_deg = Sep_FOC_NormalizeDegreeTarget(Target);
+    float current_angle_deg = Get_Angle();
+    float error_deg = cycle_diff(target_angle_deg - current_angle_deg, 360.0f);
+    float error_rad = deg2rad(error_deg);
+    float dt = (float)SEP_FOC_POSCUR_OUTER_DIV / (float)SPEED_CALCU_FREQ;
+    float derivative = 0.0f;
+    float p_term = 0.0f;
+    float i_term = 0.0f;
+    float d_term = 0.0f;
+    float integral_candidate = 0.0f;
+    float pid_target_q_unsat = 0.0f;
+    float pid_target_q = 0.0f;
+    float startup_comp_q = 0.0f;
+    float damping_comp_q = 0.0f;
+    float min_comp_q = 0.0f;
+    float target_q = 0.0f;
+
+    if (dt <= 0.0f)
+    {
+        dt = 1.0f / (float)SPEED_CALCU_FREQ;
+    }
+
+    derivative = (error_rad - poscur_last_angle_error) / dt;
+    p_term = poscur_position_kp * error_rad;
+    d_term = poscur_position_kd * derivative;
+    integral_candidate = poscur_angle_error_integral + error_rad * dt;
+
+    if (poscur_position_ki > 0.0f)
+    {
+        float integral_limit = poscur_current_limit / poscur_position_ki;
+        integral_candidate = _constrain(integral_candidate, -integral_limit, integral_limit);
+        pid_target_q_unsat = p_term + (poscur_position_ki * integral_candidate) + d_term;
+
+        if (((pid_target_q_unsat < poscur_current_limit) && (pid_target_q_unsat > -poscur_current_limit)) ||
+            ((pid_target_q_unsat >= poscur_current_limit) && (error_rad < 0.0f)) ||
+            ((pid_target_q_unsat <= -poscur_current_limit) && (error_rad > 0.0f)))
+        {
+            poscur_angle_error_integral = integral_candidate;
+        }
+    }
+
+    i_term = poscur_position_ki * poscur_angle_error_integral;
+    pid_target_q = p_term + i_term + d_term;
+    pid_target_q = _constrain(pid_target_q, -poscur_current_limit, poscur_current_limit);
+
+    // 速度阻尼：速度越大，给的阻尼越大，用来减轻过冲和靠近目标时的摆动。
+    damping_comp_q = -poscur_damping_gain * motor_speed;
+
+    // 启动力矩补偿：大误差且转子几乎没动时，额外补一点电流帮助克服静摩擦。
+    if ((fabsf(error_deg) > poscur_startup_error_threshold_deg) &&
+        (fabsf(motor_speed) < poscur_startup_speed_threshold))
+    {
+        startup_comp_q = (error_rad >= 0.0f) ? poscur_startup_boost_q : -poscur_startup_boost_q;
+    }
+
+    target_q = pid_target_q + damping_comp_q + startup_comp_q;
+
+    // 最小力矩补偿：误差还明显时，保证最终目标电流不低于一个最小可推动值。
+    if ((fabsf(error_deg) > poscur_min_comp_error_threshold_deg) &&
+        (fabsf(target_q) < poscur_min_torque_comp_q))
+    {
+        float min_target_q = (error_rad >= 0.0f) ? poscur_min_torque_comp_q : -poscur_min_torque_comp_q;
+        min_comp_q = min_target_q - target_q;
+        target_q = min_target_q;
+    }
+
+    target_q = _constrain(target_q, -poscur_current_limit, poscur_current_limit);
+
+    position_target_angle = target_angle_deg;
+    poscur_pid_target_q = pid_target_q;
+    poscur_damping_comp_q = damping_comp_q;
+    poscur_startup_comp_q = startup_comp_q;
+    poscur_min_comp_q = min_comp_q;
+    poscur_current_target_q = target_q;
+    poscur_last_angle_error = error_rad;
 }
 
 /**********************************************************************************************
@@ -534,6 +1031,88 @@ float Sep_FOC_GetVelocityTarget(void)
 float Sep_FOC_GetVelocityOutput(void)
 {
     return speed_loop_output;
+}
+
+/**********************************************************************************************
+ * @brief  读取串级模式外环给出的速度目标
+ * @note   该值是位置环输出、速度环输入，便于观察串级环是否已经开始限速或跟踪。
+ *********************************************************************************************/
+float Sep_FOC_GetPositionVelocitySpeedTarget(void)
+{
+    return posvel_speed_target;
+}
+
+/**********************************************************************************************
+ * @brief  读取速度-电流串级模式下的目标速度
+ *********************************************************************************************/
+float Sep_FOC_GetVelocityCurrentTarget(void)
+{
+    return spcur_speed_target;
+}
+
+/**********************************************************************************************
+ * @brief  读取速度-电流串级模式外环给出的目标电流
+ *********************************************************************************************/
+float Sep_FOC_GetVelocityCurrentTargetQ(void)
+{
+    return spcur_current_target_q;
+}
+
+/**********************************************************************************************
+ * @brief  读取三环模式最外环给出的速度目标
+ *********************************************************************************************/
+float Sep_FOC_GetPositionVelocityCurrentSpeedTarget(void)
+{
+    return posvcur_speed_target;
+}
+
+/**********************************************************************************************
+ * @brief  读取三环模式中间速度环给出的目标电流
+ *********************************************************************************************/
+float Sep_FOC_GetPositionVelocityCurrentTargetQ(void)
+{
+    return posvcur_current_target_q;
+}
+
+/**********************************************************************************************
+ * @brief  读取位置-电流串级模式外环给出的最终目标电流
+ *********************************************************************************************/
+float Sep_FOC_GetPositionCurrentTargetQ(void)
+{
+    return poscur_current_target_q;
+}
+
+/**********************************************************************************************
+ * @brief  读取位置-电流串级模式外环 PID 的基础输出电流
+ * @note   这个值还没叠加启动力矩补偿、速度阻尼和最小力矩补偿。
+ *********************************************************************************************/
+float Sep_FOC_GetPositionCurrentPidTargetQ(void)
+{
+    return poscur_pid_target_q;
+}
+
+/**********************************************************************************************
+ * @brief  读取位置-电流串级模式中的启动力矩补偿电流
+ *********************************************************************************************/
+float Sep_FOC_GetPositionCurrentStartupCompQ(void)
+{
+    return poscur_startup_comp_q;
+}
+
+/**********************************************************************************************
+ * @brief  读取位置-电流串级模式中的速度阻尼补偿电流
+ *********************************************************************************************/
+float Sep_FOC_GetPositionCurrentDampingCompQ(void)
+{
+    return poscur_damping_comp_q;
+}
+
+/**********************************************************************************************
+ * @brief  读取位置-电流串级模式中的最小力矩补偿电流
+ *********************************************************************************************/
+float Sep_FOC_GetPositionCurrentMinCompQ(void)
+{
+    return poscur_min_comp_q;
 }
 
 /**********************************************************************************************
@@ -627,6 +1206,16 @@ static void Sep_FOC_ResetLoopStates(void)
     position_target_angle = 0.0f;
     position_output_uq = 0.0f;
     speed_target = 0.0f;
+    posvel_speed_target = 0.0f;
+    spcur_speed_target = 0.0f;
+    spcur_current_target_q = 0.0f;
+    posvcur_speed_target = 0.0f;
+    posvcur_current_target_q = 0.0f;
+    poscur_current_target_q = 0.0f;
+    poscur_pid_target_q = 0.0f;
+    poscur_startup_comp_q = 0.0f;
+    poscur_damping_comp_q = 0.0f;
+    poscur_min_comp_q = 0.0f;
     speed_loop_error = 0.0f;
     speed_loop_last_error = 0.0f;
     speed_loop_prev_error = 0.0f;
@@ -637,6 +1226,18 @@ static void Sep_FOC_ResetLoopStates(void)
     current_loop_integral = 0.0f;
     angle_error_integral = 0.0f;
     last_angle_error = 0.0f;
+    posvel_angle_error_integral = 0.0f;
+    posvel_last_angle_error = 0.0f;
+    posvel_outer_div_counter = 0U;
+    spcur_speed_error_integral = 0.0f;
+    spcur_last_speed_error = 0.0f;
+    posvcur_angle_error_integral = 0.0f;
+    posvcur_last_angle_error = 0.0f;
+    posvcur_speed_error_integral = 0.0f;
+    posvcur_last_speed_error = 0.0f;
+    posvcur_outer_div_counter = 0U;
+    poscur_angle_error_integral = 0.0f;
+    poscur_last_angle_error = 0.0f;
     foc_applied_uq = 0.0f;
     FOC.Iq_filtered = 0.0f;
 }
@@ -659,6 +1260,7 @@ void Sep_FOC_SetControlMode(SepFocControlMode mode)
 {
     foc_control_mode = mode;
     Sep_FOC_ResetLoopStates();
+    position_target_angle = Sep_FOC_GetModeHoldTarget(mode);
     setTorque(0.0f, _electricalAngle());
 }
 
@@ -668,6 +1270,31 @@ void Sep_FOC_SetControlMode(SepFocControlMode mode)
 SepFocControlMode Sep_FOC_GetControlMode(void)
 {
     return foc_control_mode;
+}
+
+/**********************************************************************************************
+ * @brief  返回某个模式切入时推荐的安全保持目标
+ * @param  mode: 目标控制模式
+ * @return 该模式下建议写入的初始目标值
+ * @note   位置类模式默认锁定当前位置，避免一切模式就被旧目标或 0 度拉走。
+ *********************************************************************************************/
+float Sep_FOC_GetModeHoldTarget(SepFocControlMode mode)
+{
+    switch (mode)
+    {
+        case SEP_FOC_MODE_POSITION:
+        case SEP_FOC_MODE_POSITION_VELOCITY:
+        case SEP_FOC_MODE_POSITION_CURRENT:
+        case SEP_FOC_MODE_POSITION_VELOCITY_CURRENT:
+            return Get_Angle();
+        case SEP_FOC_MODE_TORQUE_VOLTAGE:
+        case SEP_FOC_MODE_TORQUE_CURRENT:
+        case SEP_FOC_MODE_VELOCITY:
+        case SEP_FOC_MODE_VELOCITY_CURRENT:
+        case SEP_FOC_MODE_DISABLED:
+        default:
+            return 0.0f;
+    }
 }
 
 /**********************************************************************************************
@@ -686,6 +1313,14 @@ const char *Sep_FOC_GetControlModeName(void)
             return "Position";
         case SEP_FOC_MODE_VELOCITY:
             return "Velocity";
+        case SEP_FOC_MODE_POSITION_VELOCITY:
+            return "PositionVelocity";
+        case SEP_FOC_MODE_POSITION_CURRENT:
+            return "PositionCurrent";
+        case SEP_FOC_MODE_VELOCITY_CURRENT:
+            return "VelocityCurrent";
+        case SEP_FOC_MODE_POSITION_VELOCITY_CURRENT:
+            return "PositionVelocityCurrent";
         case SEP_FOC_MODE_DISABLED:
         default:
             return "Disabled";
@@ -695,7 +1330,8 @@ const char *Sep_FOC_GetControlModeName(void)
 /**********************************************************************************************
  * @brief  根据当前控制模式返回慢环分频
  * @return 0 表示当前模式不需要在 TIM7 慢环里执行
- * @note   电流环走 ADC 同步快环，速度/位置/电压力矩模式走 TIM7 慢环。
+ * @note   纯电流环走 ADC 同步快环；速度/位置/电压力矩走 TIM7 慢环；
+ *         带电流内环的串级模式则由 TIM7 跑外层/中层，ADC 回调跑最内层电流环。
  *********************************************************************************************/
 uint8_t Sep_FOC_GetSlowLoopDivider(void)
 {
@@ -707,6 +1343,14 @@ uint8_t Sep_FOC_GetSlowLoopDivider(void)
             return SEP_FOC_POSITION_LOOP_DIV;
         case SEP_FOC_MODE_VELOCITY:
             return SEP_FOC_VELOCITY_LOOP_DIV;
+        case SEP_FOC_MODE_POSITION_VELOCITY:
+            return SEP_FOC_POSVEL_INNER_DIV;
+        case SEP_FOC_MODE_POSITION_CURRENT:
+            return SEP_FOC_POSCUR_OUTER_DIV;
+        case SEP_FOC_MODE_VELOCITY_CURRENT:
+            return SEP_FOC_SPCUR_OUTER_DIV;
+        case SEP_FOC_MODE_POSITION_VELOCITY_CURRENT:
+            return SEP_FOC_POSVCUR_SPEED_DIV;
         case SEP_FOC_MODE_TORQUE_CURRENT:
         case SEP_FOC_MODE_DISABLED:
         default:
@@ -717,13 +1361,26 @@ uint8_t Sep_FOC_GetSlowLoopDivider(void)
 /**********************************************************************************************
  * @brief  快环统一入口
  * @param  target: 当前模式对应的目标值
- * @note   目前只有电流模式会在 ADC 回调里执行，后面如果加 dq 电流双环也继续放这里。
+ * @note   当前由 ADC 回调驱动。纯电流模式直接使用串口目标电流，
+ *         各种带电流内环的串级模式则使用对应外层/中层刚算好的目标电流。
  *********************************************************************************************/
 void Sep_FOC_RunFastLoop(float target)
 {
     if (foc_control_mode == SEP_FOC_MODE_TORQUE_CURRENT)
     {
         Sep_Foc_lib_torque_control(target);
+    }
+    else if (foc_control_mode == SEP_FOC_MODE_POSITION_CURRENT)
+    {
+        Sep_Foc_lib_torque_control(poscur_current_target_q);
+    }
+    else if (foc_control_mode == SEP_FOC_MODE_VELOCITY_CURRENT)
+    {
+        Sep_Foc_lib_torque_control(spcur_current_target_q);
+    }
+    else if (foc_control_mode == SEP_FOC_MODE_POSITION_VELOCITY_CURRENT)
+    {
+        Sep_Foc_lib_torque_control(posvcur_current_target_q);
     }
 }
 
@@ -744,6 +1401,18 @@ void Sep_FOC_RunSlowLoop(float target)
             break;
         case SEP_FOC_MODE_VELOCITY:
             Sep_FOC_M0_setVelocity(target);
+            break;
+        case SEP_FOC_MODE_POSITION_VELOCITY:
+            Sep_FOC_M0_set_PositionVelocity(target);
+            break;
+        case SEP_FOC_MODE_POSITION_CURRENT:
+            Sep_FOC_M0_set_PositionCurrent(target);
+            break;
+        case SEP_FOC_MODE_VELOCITY_CURRENT:
+            Sep_FOC_M0_set_VelocityCurrent(target);
+            break;
+        case SEP_FOC_MODE_POSITION_VELOCITY_CURRENT:
+            Sep_FOC_M0_set_PositionVelocityCurrent(target);
             break;
         case SEP_FOC_MODE_DISABLED:
             setTorque(0.0f, _electricalAngle());

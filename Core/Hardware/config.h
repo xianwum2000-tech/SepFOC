@@ -9,6 +9,10 @@ typedef enum
     SEP_FOC_MODE_TORQUE_CURRENT,    // 目标 Q 电流的纯力矩环（电流模式）
     SEP_FOC_MODE_POSITION,          // 纯位置闭环
     SEP_FOC_MODE_VELOCITY,          // 纯速度闭环
+    SEP_FOC_MODE_POSITION_VELOCITY, // 位置-速度串级闭环
+    SEP_FOC_MODE_POSITION_CURRENT,  // 位置-电流串级闭环
+    SEP_FOC_MODE_VELOCITY_CURRENT,  // 速度-电流串级闭环
+    SEP_FOC_MODE_POSITION_VELOCITY_CURRENT, // 位置-速度-电流三环闭环
     SEP_FOC_MODE_COUNT              // 当前已实现的模式数量，供串口等范围检查使用
 } SepFocControlMode;
 
@@ -23,6 +27,20 @@ typedef enum
 #define SEP_FOC_VOLTAGE_LOOP_DIV 1U                           // 电压力矩环分频，4000 / 1 = 4000 Hz
 #define SEP_FOC_VELOCITY_LOOP_DIV 4U                          // 速度环分频，4000 / 4 = 1000 Hz
 #define SEP_FOC_POSITION_LOOP_DIV 8U                          // 位置环分频，4000 / 8 = 500 Hz
+#define SEP_FOC_POSVEL_INNER_DIV 4U                           // 串级模式内环速度环分频，4000 / 4 = 1000 Hz
+#define SEP_FOC_POSVEL_OUTER_DIV 8U                           // 串级模式外环位置环分频，4000 / 8 = 500 Hz
+#define SEP_FOC_POSCUR_OUTER_DIV 8U                           // 位置-电流串级外环位置环分频，4000 / 8 = 500 Hz
+#define SEP_FOC_SPCUR_OUTER_DIV 4U                            // 速度-电流串级外环速度环分频，4000 / 4 = 1000 Hz
+#define SEP_FOC_POSVCUR_SPEED_DIV 4U                          // 三环模式中间速度环分频，4000 / 4 = 1000 Hz
+#define SEP_FOC_POSVCUR_POSITION_DIV 8U                       // 三环模式最外层位置环分频，4000 / 8 = 500 Hz
+
+// VOFA 调试打印类型配置
+#define VOFA_DEBUG_PRINT_FULL_DATA   0U                       // 全量调试数据：mode/target/speed/Uq/Iq/angle/n
+#define VOFA_DEBUG_PRINT_POSVEL_DATA 1U                       // 串级位置-速度调试：mode/target/angle/error/speed_tgt/speed/Uq
+#define VOFA_DEBUG_PRINT_POSCUR_DATA 2U                       // 串级位置-电流调试：mode/target/angle/error/iq_tgt/iq/Uq
+#define VOFA_DEBUG_PRINT_SPCUR_DATA  3U                       // 串级速度-电流调试：mode/target/speed/error/iq_tgt/iq/Uq
+#define VOFA_DEBUG_PRINT_POSVCUR_DATA 4U                      // 三环调试：mode/target_angle/angle/speed_tgt/speed/iq_tgt/iq
+#define VOFA_DEBUG_PRINT_TYPE        VOFA_DEBUG_PRINT_POSVCUR_DATA
 
 
 // 常用换算宏

@@ -53,6 +53,7 @@ int main(void)
     set_rotor_zero_angle();
     // 初始化当前控制模式，上电时就确定跑哪一种环
     Sep_FOC_Control_Init(SEP_FOC_STARTUP_MODE);
+    motor_target_val = Sep_FOC_GetModeHoldTarget(SEP_FOC_STARTUP_MODE);
 
     // ADC 校准
     HAL_ADCEx_Calibration_Start(&hadc1, 0);
