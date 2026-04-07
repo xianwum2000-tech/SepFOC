@@ -1,5 +1,6 @@
 #include "Vofa.h"
 #include <stdio.h>
+#include <string.h>
 #include "adc.h"
 #include "MT6701.h"
 #include "SepFoc.h"
@@ -22,6 +23,67 @@ static volatile float vofa_debug_poscur_current_target = 0.0f;
 static volatile float vofa_debug_spcur_current_target = 0.0f;
 static volatile float vofa_debug_posvcur_speed_target = 0.0f;
 static volatile float vofa_debug_posvcur_current_target = 0.0f;
+
+#define VOFA_TEXT_EVENT_QUEUE_SIZE    8U
+#define VOFA_TEXT_NAME_MAX_LEN        16U
+
+typedef enum
+{
+    VOFA_TEXT_EVENT_NONE = 0,
+    VOFA_TEXT_EVENT_ADC_ERROR,
+    VOFA_TEXT_EVENT_MODE_OK,
+    VOFA_TEXT_EVENT_MODE_ERR,
+    VOFA_TEXT_EVENT_FUNC_OK,
+    VOFA_TEXT_EVENT_FUNC_ERR,
+    VOFA_TEXT_EVENT_FUNC_VALUE
+} VofaTextEventType;
+
+typedef struct
+{
+    VofaTextEventType type;
+    long integer_value;
+    float float_value;
+    char name[VOFA_TEXT_NAME_MAX_LEN];
+} VofaTextEvent;
+
+static volatile uint8_t vofa_text_queue_head = 0U;
+static volatile uint8_t vofa_text_queue_tail = 0U;
+static VofaTextEvent vofa_text_queue[VOFA_TEXT_EVENT_QUEUE_SIZE];
+
+/**********************************************************************************************
+ * @brief  向文本状态队列压入一条消息
+ * @param  type: 消息类型
+ * @param  integer_value: 整型附加参数
+ * @param  name: 文本参数名，可为空
+ * @param  float_value: 浮点附加参数
+ * @note   允许在中断中调用；队列满时丢弃最新一条，优先保证控制不被打印阻塞。
+ *********************************************************************************************/
+static void Vofa_QueueTextEvent(VofaTextEventType type, long integer_value, const char *name, float float_value)
+{
+    uint32_t primask = __get_PRIMASK();
+    uint8_t next_tail = 0U;
+
+    __disable_irq();
+    next_tail = (uint8_t)((vofa_text_queue_tail + 1U) % VOFA_TEXT_EVENT_QUEUE_SIZE);
+    if (next_tail != vofa_text_queue_head)
+    {
+        VofaTextEvent *event = &vofa_text_queue[vofa_text_queue_tail];
+        event->type = type;
+        event->integer_value = integer_value;
+        event->float_value = float_value;
+        event->name[0] = '\0';
+        if (name != NULL)
+        {
+            strncpy(event->name, name, VOFA_TEXT_NAME_MAX_LEN - 1U);
+            event->name[VOFA_TEXT_NAME_MAX_LEN - 1U] = '\0';
+        }
+        vofa_text_queue_tail = next_tail;
+    }
+    if (!primask)
+    {
+        __enable_irq();
+    }
+}
 
 /**********************************************************************************************
  * @brief  根据当前控制模式，返回串口调试里应该显示的目标量
@@ -105,7 +167,12 @@ void Vofa_PrintDebugFrame(void)
 {
     SepFocControlMode mode = SEP_FOC_MODE_DISABLED;
     float target = 0.0f;
+#if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA) || \
+    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVEL_DATA) || \
+    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSCUR_DATA) || \
+    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_SPCUR_DATA)
     float uq_avg = 0.0f;
+#endif
 #if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA)
     float speed_avg = 0.0f;
     float iq_avg = 0.0f;
@@ -142,7 +209,12 @@ void Vofa_PrintDebugFrame(void)
     __disable_irq();
     mode = vofa_debug_mode;
     target = vofa_debug_target;
+#if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA) || \
+    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVEL_DATA) || \
+    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSCUR_DATA) || \
+    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_SPCUR_DATA)
     uq_avg = vofa_debug_uq_avg;
+#endif
 #if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA)
     speed_avg = vofa_debug_speed_avg;
     iq_avg = vofa_debug_iq_avg;
@@ -236,6 +308,54 @@ void Vofa_PrintDebugFrame(void)
 }
 
 /**********************************************************************************************
+ * @brief  在主循环中安全输出一条文本状态消息
+ * @note   该函数每次只消费一条消息，避免文本状态回显长时间占用串口发送带宽。
+ *********************************************************************************************/
+void Vofa_ProcessPendingTextFrame(void)
+{
+    VofaTextEvent event = {VOFA_TEXT_EVENT_NONE, 0L, 0.0f, {0}};
+    uint32_t primask = __get_PRIMASK();
+
+    if (vofa_text_queue_head == vofa_text_queue_tail)
+    {
+        return;
+    }
+
+    __disable_irq();
+    event = vofa_text_queue[vofa_text_queue_head];
+    vofa_text_queue_head = (uint8_t)((vofa_text_queue_head + 1U) % VOFA_TEXT_EVENT_QUEUE_SIZE);
+    if (!primask)
+    {
+        __enable_irq();
+    }
+
+    switch (event.type)
+    {
+        case VOFA_TEXT_EVENT_ADC_ERROR:
+            Vofa_PrintAdcError((uint32_t)event.integer_value);
+            break;
+        case VOFA_TEXT_EVENT_MODE_OK:
+            Vofa_PrintModeSwitchOk((uint32_t)event.integer_value);
+            break;
+        case VOFA_TEXT_EVENT_MODE_ERR:
+            Vofa_PrintModeSwitchError(event.integer_value);
+            break;
+        case VOFA_TEXT_EVENT_FUNC_OK:
+            Vofa_PrintFunctionSwitchOk((uint32_t)event.integer_value);
+            break;
+        case VOFA_TEXT_EVENT_FUNC_ERR:
+            Vofa_PrintFunctionSwitchError(event.integer_value);
+            break;
+        case VOFA_TEXT_EVENT_FUNC_VALUE:
+            Vofa_PrintFunctionValueUpdate(event.name, event.float_value);
+            break;
+        case VOFA_TEXT_EVENT_NONE:
+        default:
+            break;
+    }
+}
+
+/**********************************************************************************************
  * @brief  输出 ADC 错误信息
  * @param  error_code: HAL ADC 错误码
  * @note   这类故障日志也统一放在 Vofa 模块里，避免串口打印逻辑分散。
@@ -243,6 +363,15 @@ void Vofa_PrintDebugFrame(void)
 void Vofa_PrintAdcError(uint32_t error_code)
 {
     printf("ADC1 Error! Error Code: 0x%04X\r\n", (unsigned int)error_code);
+}
+
+/**********************************************************************************************
+ * @brief  请求缓存 ADC 错误信息
+ * @param  error_code: HAL ADC 错误码
+ *********************************************************************************************/
+void Vofa_RequestAdcError(uint32_t error_code)
+{
+    Vofa_QueueTextEvent(VOFA_TEXT_EVENT_ADC_ERROR, (long)error_code, NULL, 0.0f);
 }
 
 /**********************************************************************************************
@@ -291,6 +420,15 @@ void Vofa_PrintModeSwitchOk(uint32_t mode)
 }
 
 /**********************************************************************************************
+ * @brief  请求缓存模式切换成功信息
+ * @param  mode: 需要回显的控制模式编号
+ *********************************************************************************************/
+void Vofa_RequestModeSwitchOk(uint32_t mode)
+{
+    Vofa_QueueTextEvent(VOFA_TEXT_EVENT_MODE_OK, (long)mode, NULL, 0.0f);
+}
+
+/**********************************************************************************************
  * @brief  输出非法模式编号回显
  * @param  mode: 用户输入的非法模式编号
  * @note   当串口收到超范围的 M 命令时调用，方便快速判断命令没有生效的原因。
@@ -300,4 +438,86 @@ void Vofa_PrintModeSwitchError(long mode)
     printf("# MODE ERR: M%ld out of range [0,%d]\r\n",
            mode,
            (int)(SEP_FOC_MODE_COUNT - 1));
+}
+
+/**********************************************************************************************
+ * @brief  请求缓存非法模式错误信息
+ * @param  mode: 用户输入的非法控制模式编号
+ *********************************************************************************************/
+void Vofa_RequestModeSwitchError(long mode)
+{
+    Vofa_QueueTextEvent(VOFA_TEXT_EVENT_MODE_ERR, mode, NULL, 0.0f);
+}
+
+/**********************************************************************************************
+ * @brief  输出 Function 模块模式切换成功回显
+ * @param  mode: 功能模式编号，0=关闭，1=纯阻尼感，2=定格感
+ *********************************************************************************************/
+void Vofa_PrintFunctionSwitchOk(uint32_t mode)
+{
+    const char *mode_name = "Unknown";
+
+    switch (mode)
+    {
+        case 0U:
+            mode_name = "Disabled";
+            break;
+        case 1U:
+            mode_name = "PureDamping";
+            break;
+        case 2U:
+            mode_name = "Detent";
+            break;
+        default:
+            break;
+    }
+
+    printf("# FUNC OK: X%lu -> %s\r\n", (unsigned long)mode, mode_name);
+}
+
+/**********************************************************************************************
+ * @brief  请求缓存 Function 模式切换成功信息
+ * @param  mode: 需要回显的功能模式编号
+ *********************************************************************************************/
+void Vofa_RequestFunctionSwitchOk(uint32_t mode)
+{
+    Vofa_QueueTextEvent(VOFA_TEXT_EVENT_FUNC_OK, (long)mode, NULL, 0.0f);
+}
+
+/**********************************************************************************************
+ * @brief  输出非法 Function 模式编号回显
+ * @param  mode: 用户输入的非法功能模式编号
+ *********************************************************************************************/
+void Vofa_PrintFunctionSwitchError(long mode)
+{
+    printf("# FUNC ERR: X%ld out of range [0,2]\r\n", mode);
+}
+
+/**********************************************************************************************
+ * @brief  请求缓存非法 Function 模式错误信息
+ * @param  mode: 用户输入的非法功能模式编号
+ *********************************************************************************************/
+void Vofa_RequestFunctionSwitchError(long mode)
+{
+    Vofa_QueueTextEvent(VOFA_TEXT_EVENT_FUNC_ERR, mode, NULL, 0.0f);
+}
+
+/**********************************************************************************************
+ * @brief  输出 Function 模块参数更新回显
+ * @param  name: 参数名
+ * @param  value: 新值
+ *********************************************************************************************/
+void Vofa_PrintFunctionValueUpdate(const char *name, float value)
+{
+    printf("# FUNC SET: %s=%+.4f\r\n", name, value);
+}
+
+/**********************************************************************************************
+ * @brief  请求缓存 Function 参数更新信息
+ * @param  name: 参数名
+ * @param  value: 参数值
+ *********************************************************************************************/
+void Vofa_RequestFunctionValueUpdate(const char *name, float value)
+{
+    Vofa_QueueTextEvent(VOFA_TEXT_EVENT_FUNC_VALUE, 0L, name, value);
 }

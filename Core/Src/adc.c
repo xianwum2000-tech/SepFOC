@@ -19,6 +19,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "adc.h"
+#include "Function.h"
 
 /* USER CODE BEGIN 0 */
 
@@ -249,8 +250,16 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 		motor_i_v = i_v_filt;                  // 对应MB
 		motor_i_w = -(motor_i_u + motor_i_v);  // 对应MC
 
-        // 电流环模式下，Q 轴电流环与采样节拍同步执行
-        Sep_FOC_RunFastLoop(motor_target_val);
+        // Function 模块启用时，由它接管快环输出；否则继续走原有 FOC 快环。
+        if (Function_Control_IsEnabled())
+        {
+            Function_Control_RunFastLoop();
+        }
+        else
+        {
+            // 电流环模式下，Q 轴电流环与采样节拍同步执行
+            Sep_FOC_RunFastLoop(motor_target_val);
+        }
 
       // 测试
       // motor_i_u = i_1;                  
@@ -337,7 +346,8 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef* hadc)
 {
     if(hadc->Instance == ADC1)
     {
-        Vofa_PrintAdcError(hadc->ErrorCode);
+        // ADC 错误回显也改成前台打印，避免中断里等待串口发送
+        Vofa_RequestAdcError(hadc->ErrorCode);
     }
     
     HAL_ADC_Stop_DMA(hadc);

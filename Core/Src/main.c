@@ -82,6 +82,9 @@ int main(void)
 
     while (1)
     {
+        // 先把中断里登记的文本状态安全打印出去，避免接收回显卡在中断里
+        Vofa_ProcessPendingTextFrame();
+
         // 串口打印可能阻塞前台，但不会影响定时器/ADC 里的闭环调度
         Vofa_PrintDebugFrame();
 

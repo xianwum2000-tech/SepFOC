@@ -777,6 +777,16 @@
               <FileType>5</FileType>
               <FilePath>..\Core\Hardware\Vofa.h</FilePath>
             </File>
+            <File>
+              <FileName>Function.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Hardware\Function.c</FilePath>
+            </File>
+            <File>
+              <FileName>Function.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Hardware\Function.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

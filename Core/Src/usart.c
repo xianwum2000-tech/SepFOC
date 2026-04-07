@@ -169,6 +169,7 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 
 #include "stdio.h"
 #include "stdlib.h"
+#include "Function.h"
 
 uint8_t uart_tx_buf[512]; 
 uint16_t uart_tx_len = 0;
@@ -211,7 +212,7 @@ uint8_t g_rx_byte;                 // 接收单个字节的缓冲
 uint8_t temp_buf[20];              // 解析数字时的临时缓存
 uint8_t buf_idx = 0;               // 缓冲索引
 uint8_t start_flag = 0;            // 接收状态位
-uint8_t rx_cmd_type = 0;           // 当前接收命令类型：0=无，'F'=目标值，'M'=模式切换
+uint8_t rx_cmd_type = 0;           // 当前接收命令类型：0=无，'F'=目标值，'M'=模式切换，'X'=Function 模式
 
 void USART3_Rx_Init(void)
 {
@@ -232,6 +233,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         // 串口协议：
         // Fxxx -> 给当前模式写统一目标值，例如 F0.10 / F50
         // Mx   -> 切换控制模式，模式编号顺序与 SepFocControlMode 保持一致
+        // Xx   -> 切换 Function 模式，X0=关闭，X1=纯阻尼感，X2=定格感
         if(ch == 'F' || ch == 'f') {
             start_flag = 1;
             rx_cmd_type = 'F';
@@ -240,6 +242,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         else if(ch == 'M' || ch == 'm') {
             start_flag = 1;
             rx_cmd_type = 'M';
+            buf_idx = 0;
+        }
+        else if(ch == 'X' || ch == 'x') {
+            start_flag = 1;
+            rx_cmd_type = 'X';
             buf_idx = 0;
         }
         else if(start_flag) {
@@ -254,8 +261,21 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                 // 收到回车换行后，把缓存转成浮点数
                 else if(ch == '\r' || ch == '\n') {
                     if(buf_idx > 0) {
+                        float value = 0.0f;
                         temp_buf[buf_idx] = '\0'; // 字符串结束
-                        motor_target_val = (float)atof((char*)temp_buf);
+                        value = (float)atof((char*)temp_buf);
+
+                        if(Function_Control_GetMode() == FUNCTION_CONTROL_PURE_DAMPING) {
+                            Function_Control_SetPureDampingKp(value);
+                            motor_target_val = Function_Control_GetPureDampingKp();
+                            Vofa_RequestFunctionValueUpdate("DampingKp", motor_target_val);
+                        }
+                        else if(Function_Control_GetMode() == FUNCTION_CONTROL_DETENT) {
+                            // X2 定格感模式下不接收 F 参数，直接忽略
+                        }
+                        else {
+                            motor_target_val = value;
+                        }
                     }
                     start_flag = 0;
                     rx_cmd_type = 0;
@@ -278,13 +298,56 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                         mode_val = strtol((char*)temp_buf, NULL, 10);
                         if((mode_val >= 0) && (mode_val < (long)SEP_FOC_MODE_COUNT)) {
                             new_mode = (SepFocControlMode)mode_val;
+                            Function_Control_ResetConfigsToDefault();
+                            Function_Control_Disable();
                             // 位置类模式默认锁当前位置，其余模式默认目标清零，避免切换瞬间误动作
                             motor_target_val = Sep_FOC_GetModeHoldTarget(new_mode);
                             Sep_FOC_SetControlMode(new_mode);
-                            Vofa_PrintModeSwitchOk((uint32_t)mode_val);
+                            Vofa_RequestModeSwitchOk((uint32_t)mode_val);
                         }
                         else {
-                            Vofa_PrintModeSwitchError(mode_val);
+                            Vofa_RequestModeSwitchError(mode_val);
+                        }
+                    }
+                    start_flag = 0;
+                    rx_cmd_type = 0;
+                    buf_idx = 0;
+                }
+            }
+            else if(rx_cmd_type == 'X')
+            {
+                // X 命令只接收整数功能模式编号
+                if(ch >= '0' && ch <= '9') {
+                    if(buf_idx < 18) {
+                        temp_buf[buf_idx++] = ch;
+                    }
+                }
+                else if(ch == '\r' || ch == '\n') {
+                    if(buf_idx > 0) {
+                        long func_mode = 0;
+                        temp_buf[buf_idx] = '\0';
+                        func_mode = strtol((char*)temp_buf, NULL, 10);
+
+                        // 每次进入或退出 X 模式前都恢复默认配置
+                        Function_Control_ResetConfigsToDefault();
+
+                        if(func_mode == 0) {
+                            Function_Control_Disable();
+                            motor_target_val = 0.0f;
+                            Vofa_RequestFunctionSwitchOk((uint32_t)func_mode);
+                        }
+                        else if(func_mode == 1) {
+                            Function_Control_EnablePureDampingDefault();
+                            motor_target_val = Function_Control_GetPureDampingKp();
+                            Vofa_RequestFunctionSwitchOk((uint32_t)func_mode);
+                        }
+                        else if(func_mode == 2) {
+                            Function_Control_EnableDetentDefault();
+                            motor_target_val = 0.0f;
+                            Vofa_RequestFunctionSwitchOk((uint32_t)func_mode);
+                        }
+                        else {
+                            Vofa_RequestFunctionSwitchError(func_mode);
                         }
                     }
                     start_flag = 0;

@@ -237,17 +237,49 @@ void setPwm(float Ua, float Ub, float Uc)
 	
 }
 
+/**********************************************************************************************
+ * @brief  将 αβ 静止坐标系电压矢量映射为三相 SVPWM 等效相电压
+ * @param  Ualpha/Ubeta: αβ 轴电压，单位 V
+ * @note   这里采用零序注入法实现线性区 SVPWM，最终仍然输出 0~Vbus 的三相等效电压，
+ *         这样可以直接复用当前 setPwm() 和 TIM 占空比映射，不需要改底层驱动接口。
+ *********************************************************************************************/
+static void Sep_FOC_SetPhaseVoltageSVPWM(float Ualpha, float Ubeta)
+{
+    float phase_a = Ualpha;
+    float phase_b = -0.5f * Ualpha + 0.5f * SQRT3 * Ubeta;
+    float phase_c = -0.5f * Ualpha - 0.5f * SQRT3 * Ubeta;
+    float phase_max = phase_a;
+    float phase_min = phase_a;
+    float common_mode = 0.0f;
+
+    if (phase_b > phase_max) phase_max = phase_b;
+    if (phase_c > phase_max) phase_max = phase_c;
+    if (phase_b < phase_min) phase_min = phase_b;
+    if (phase_c < phase_min) phase_min = phase_c;
+
+    // 注入公共偏置，把三相一起平移到母线窗口中央，得到比 SPWM 更大的线性调制范围
+    common_mode = 0.5f * (phase_max + phase_min);
+
+    FOC.Ua = phase_a - common_mode + BUS_VOLTAGE * 0.5f;
+    FOC.Ub = phase_b - common_mode + BUS_VOLTAGE * 0.5f;
+    FOC.Uc = phase_c - common_mode + BUS_VOLTAGE * 0.5f;
+
+    setPwm(FOC.Ua, FOC.Ub, FOC.Uc);
+}
+
 /****************************************************** 设置力矩 ****************************************************************************** */
 // 设置力矩（输出电压向量） ******************************************************************************************************************
 /**
- * @brief  设置力矩（输出电压向量）
+ * @brief  设置力矩（输出电压向量），内部使用 SVPWM 调制
  * @param  Uq: 交轴电压 (控制电流/力矩)
  * @param  angle_el: 电角度 (弧度)
  */
 void setTorque(float Uq, float angle_el) 
 {
-    // 1. 限制 Uq 输出范围，防止超过电源电压的一半（SPWM 的线性区限制）
-    Uq = _constrain(Uq, - BUS_VOLTAGE/2.0f, BUS_VOLTAGE/2.0f);
+    const float uq_limit = BUS_VOLTAGE / SQRT3;
+
+    // 1. 限制 Uq 在线性区范围内，SVPWM 线性区上限约为 Vbus / sqrt(3)
+    Uq = _constrain(Uq, -uq_limit, uq_limit);
     foc_applied_uq = Uq;
     
     float Ud = 0; // 通常 D 轴设为 0
@@ -263,112 +295,11 @@ void setTorque(float Uq, float angle_el)
     FOC.Ualpha = Ud * _cos - Uq * _sin;  
     FOC.Ubeta  = Ud * _sin + Uq * _cos;  
 
-    // 4. 逆克拉克变换 (SPWM 模式，带电源中值偏移)
-    // 这种写法等价于：Ua = Ualpha + Vbus/2
-    float v_offset = BUS_VOLTAGE / 2.0f;
-    const float sqrt3 = 1.73205081f;
-
-    FOC.Ua = FOC.Ualpha + v_offset;
-    FOC.Ub = (sqrt3 * FOC.Ubeta - FOC.Ualpha) / 2.0f + v_offset;
-    FOC.Uc = (-FOC.Ualpha - sqrt3 * FOC.Ubeta) / 2.0f + v_offset;
-
-    // 5. 调用底层硬件写入
-    setPwm(FOC.Ua, FOC.Ub, FOC.Uc);
+    // 4. 由 αβ 电压矢量生成三相 SVPWM 等效相电压，再写到底层 PWM
+    Sep_FOC_SetPhaseVoltageSVPWM(FOC.Ualpha, FOC.Ubeta);
 }
 
 
-
-/****************************************************** SVPWM ******************************************************************************** */
-// SVPWM（空间矢量脉宽调制）函数，将FOC控制中的 d/q 轴电压转换为 U/V/W 三相的 PWM 占空比 *******************************************************
-// phi：转子电角度（弧度）
-// d/q: d/q 轴电压
-// Udc: 母线电压
-// d_u/d_v/d_w: u/v/w 相占空比
-//static void Ud_Uq2SVPWM(float phi, float d, float q, float Udc, float *d_u, float *d_v, float *d_w)
-//{
-//    // 母线电压有效性判断（避免除0/负数）
-//    if (Udc <= 2.0f) 
-//    { 
-//        // Udc小于2V视为无效，输出0占空比
-//        *d_u = *d_v = *d_w = 0;
-//        return;
-//    }
-
-//    // 电压归一化
-//    // SVPWM中，α/β轴最大线性输出电压幅值为Udc/2（三相桥的固有特性）
-//    float d_norm = d * 2.0f / Udc; 
-//    float q_norm = q * 2.0f / Udc; 
-
-//    // 限幅，避免过调制
-//    d_norm = min(d_norm, MAX_NORM_V);
-//    d_norm = max(d_norm, -MAX_NORM_V);
-//    q_norm = min(q_norm, MAX_NORM_V);
-//    q_norm = max(q_norm, -MAX_NORM_V);
-
-//    // 6个有效矢量对应 U/V/W 三相的 PWM 状态（比如v[0]={1,0,0}表示 U 相上桥臂导通，V/W 下桥臂导通）
-//    const int v[6][3] = {{1, 0, 0}, {1, 1, 0}, {0, 1, 0}, {0, 1, 1}, {0, 0, 1}, {1, 0, 1}};
-//    // 扇区查找表，通过3个布尔值组合成8种状态（K=0~7），快速定位电压矢量所在的扇区（1~6），避免条件判断，提高运行效率
-//    const int K_to_sector[] = {4, 6, 5, 5, 3, 1, 2, 2};
-
-//    // Park 逆变换（d/q 轴 → α/β 轴），旋转坐标系到静止坐标系
-//    // alpha = d*cosφ - q*sinφ
-//    // beta  = d*sinφ + q*cosφ
-//    float sin_phi = arm_sin_f32(phi);
-//    float cos_phi = arm_cos_f32(phi);
-//    float alpha = 0;
-//    float beta = 0;
-//    arm_inv_park_f32(d_norm, q_norm, &alpha, &beta, sin_phi, cos_phi);
-
-//    // 扇区判断
-//    bool A = beta > 0;                                 // β轴电压是否大于0
-//    bool B = fabs(beta) > SQRT3 * fabs(alpha);         // |β| > √3|α|
-//    bool C = alpha > 0;                                // α轴电压是否大于0
-//    int K = 4 * A + 2 * B + C;                         // 组合成0~7的索引值
-//    int sector = K_to_sector[K];                       // 查表得到扇区（1~6）
-
-//    // 计算矢量作用时间
-//    float t_m = arm_sin_f32(sector * rad60) * alpha - arm_cos_f32(sector * rad60) * beta;
-//    float t_n = beta * arm_cos_f32(sector * rad60 - rad60) - alpha * arm_sin_f32(sector * rad60 - rad60);
-//    float t_0 = 1 - t_m - t_n;
-
-//    // 过调处理
-//    float t_sum = t_m + t_n;
-//    if (t_sum > 1.0f)
-//    {
-//        t_m /= t_sum;  // 归一化到总和为1
-//        t_n /= t_sum;
-//        t_0 = 0;       // 零矢量时间为0，进入过调制模式
-//    }
-
-//    // 分配三相占空比
-//    // 第一个有效矢量对 x 相的作用时间 + 第二个有效矢量对 x 相的作用时间 + 零矢量平分到 000 和 111，各占 t_0/2
-//    *d_u = t_m * v[sector - 1][0] + t_n * v[sector % 6][0] + t_0 / 2;
-//    *d_v = t_m * v[sector - 1][1] + t_n * v[sector % 6][1] + t_0 / 2;
-//    *d_w = t_m * v[sector - 1][2] + t_n * v[sector % 6][2] + t_0 / 2;
-
-//    // 占空比最终限幅（防止浮点精度问题导致超0~1）
-//    *d_u = max(0.0f, min(*d_u, 1.0f));
-//    *d_v = max(0.0f, min(*d_v, 1.0f));
-//    *d_w = max(0.0f, min(*d_w, 1.0f));
-//}
-
-
-/****************************************************** 电机转动调用 ****************************************************************************** */
-//// d/q 轴电压 --- 反帕克变换 --- SVPWM --- 三相PWM设置 ******************************************************************************
-//// d/q: d/q 轴电压
-//// electrical_rad: 转子电角度（弧度）
-//void foc_forward(float d, float q, float electrical_rad)
-//{
-//    float d_u = 0;
-//    float d_v = 0;
-//    float d_w = 0;
-
-//    //Ud_Uq2SVPWM(electrical_rad, d, q, BUS_VOLTAGE, &d_u, &d_v, &d_w);
-//    setPwm(d_u, d_v, d_w);
-//    //printf("PWM duty: U = %.2f, V = %.2f, W = %.2f\r\n", d_u, d_v, d_w);
-//    //printf("encoder_angle:%.3f, rotor_zero_angle:%.3f, rotor_electrical_angle:%.3f\r\n\n", encoder_angle, rotor_zero_angle, rotor_electrical_angle);
-//        
-//}
 
 
 
