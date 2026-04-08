@@ -212,7 +212,7 @@ uint8_t g_rx_byte;                 // 接收单个字节的缓冲
 uint8_t temp_buf[20];              // 解析数字时的临时缓存
 uint8_t buf_idx = 0;               // 缓冲索引
 uint8_t start_flag = 0;            // 接收状态位
-uint8_t rx_cmd_type = 0;           // 当前接收命令类型：0=无，'F'=目标值，'M'=模式切换，'X'=Function 模式
+uint8_t rx_cmd_type = 0;           // 当前接收命令类型：0=无，'F'=目标值，'M'=模式切换，'X'=Function 模式，'V'=VOFA视图
 
 void USART3_Rx_Init(void)
 {
@@ -234,6 +234,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         // Fxxx -> 给当前模式写统一目标值，例如 F0.10 / F50
         // Mx   -> 切换控制模式，模式编号顺序与 SepFocControlMode 保持一致
         // Xx   -> 切换 Function 模式，X0=关闭，X1=纯阻尼感，X2=定格感
+        // Vx   -> 切换 VOFA 调试视图，V0~V4 对应不同调试页
         if(ch == 'F' || ch == 'f') {
             start_flag = 1;
             rx_cmd_type = 'F';
@@ -247,6 +248,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         else if(ch == 'X' || ch == 'x') {
             start_flag = 1;
             rx_cmd_type = 'X';
+            buf_idx = 0;
+        }
+        else if(ch == 'V' || ch == 'v') {
+            start_flag = 1;
+            rx_cmd_type = 'V';
             buf_idx = 0;
         }
         else if(start_flag) {
@@ -348,6 +354,33 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                         }
                         else {
                             Vofa_RequestFunctionSwitchError(func_mode);
+                        }
+                    }
+                    start_flag = 0;
+                    rx_cmd_type = 0;
+                    buf_idx = 0;
+                }
+            }
+            else if(rx_cmd_type == 'V')
+            {
+                // V 命令只接收整数调试视图编号
+                if(ch >= '0' && ch <= '9') {
+                    if(buf_idx < 18) {
+                        temp_buf[buf_idx++] = ch;
+                    }
+                }
+                else if(ch == '\r' || ch == '\n') {
+                    if(buf_idx > 0) {
+                        long view_val = 0;
+                        temp_buf[buf_idx] = '\0';
+                        view_val = strtol((char*)temp_buf, NULL, 10);
+
+                        if((view_val >= 0) && (view_val < (long)VOFA_DEBUG_VIEW_COUNT)) {
+                            Vofa_SetDebugView((VofaDebugView)view_val);
+                            Vofa_RequestDebugViewSwitchOk((uint32_t)view_val);
+                        }
+                        else {
+                            Vofa_RequestDebugViewSwitchError(view_val);
                         }
                     }
                     start_flag = 0;

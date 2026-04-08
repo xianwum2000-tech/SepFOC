@@ -23,7 +23,7 @@ typedef enum
 #define MAX_SPEED 58.0f         // 最大转速，单位 rad/s
 
 // 控制模式配置
-#define SEP_FOC_STARTUP_MODE     SEP_FOC_MODE_TORQUE_CURRENT  // 上电默认进入的控制模式
+#define SEP_FOC_STARTUP_MODE     SEP_FOC_MODE_DISABLED 		  // 上电默认进入的控制模式
 #define SEP_FOC_VOLTAGE_LOOP_DIV 1U                           // 电压力矩环分频，4000 / 1 = 4000 Hz
 #define SEP_FOC_VELOCITY_LOOP_DIV 4U                          // 速度环分频，4000 / 4 = 1000 Hz
 #define SEP_FOC_POSITION_LOOP_DIV 8U                          // 位置环分频，4000 / 8 = 500 Hz
@@ -34,13 +34,7 @@ typedef enum
 #define SEP_FOC_POSVCUR_SPEED_DIV 4U                          // 三环模式中间速度环分频，4000 / 4 = 1000 Hz
 #define SEP_FOC_POSVCUR_POSITION_DIV 8U                       // 三环模式最外层位置环分频，4000 / 8 = 500 Hz
 
-// VOFA 调试打印类型配置
-#define VOFA_DEBUG_PRINT_FULL_DATA   0U                       // 全量调试数据：mode/target/speed/Uq/Iq/angle/n
-#define VOFA_DEBUG_PRINT_POSVEL_DATA 1U                       // 串级位置-速度调试：mode/target/angle/error/speed_tgt/speed/Uq
-#define VOFA_DEBUG_PRINT_POSCUR_DATA 2U                       // 串级位置-电流调试：mode/target/angle/error/iq_tgt/iq/Uq
-#define VOFA_DEBUG_PRINT_SPCUR_DATA  3U                       // 串级速度-电流调试：mode/target/speed/error/iq_tgt/iq/Uq
-#define VOFA_DEBUG_PRINT_POSVCUR_DATA 4U                      // 三环调试：mode/target_angle/angle/speed_tgt/speed/iq_tgt/iq
-#define VOFA_DEBUG_PRINT_TYPE        VOFA_DEBUG_PRINT_POSVCUR_DATA
+// VOFA 调试视图改为运行时切换：串口发送 V0~V4 选择不同调试页
 
 
 // 常用换算宏

@@ -42,7 +42,7 @@ int main(void)
     kalman_filter_init(&motor_speed_kalman_filter, KF_R, KF_Q);
     // 初始化 FOC 数据结构
     FOC_Data_Init(&FOC);
-
+	
     // 启动 PWM 输出
     PWM_Start();
     // 启动 TIM1 更新中断，用来同步触发编码器 SPI DMA 读取
@@ -64,19 +64,6 @@ int main(void)
     // Fxxx 表示给当前模式写统一目标值，M0~n 表示切换控制模式
     USART3_Rx_Init();
 
-    // 用于检查三相输出是否正常的测试代码
-    // 给 U 相稍大占空比、V/W 相较小占空比，形成一个指向 U 相的磁场
-//  set_pwm_duty(0.3, 0.1, 0.1, 0.9);
-//  HAL_Delay(100);
-//  // 顺时针改变磁场指向
-//  set_pwm_duty(0.1, 0.3, 0.1, 0.9);
-//  HAL_Delay(100);
-//  set_pwm_duty(0.1, 0.1, 0.3, 0.9);
-//  HAL_Delay(100);
-
-    // 手动测试编码器读取
-    //MT6701_Start_DMA_Read();
-
     // 启动速度计算定时器
     HAL_TIM_Base_Start_IT(&htim7);
 
@@ -87,11 +74,6 @@ int main(void)
 
         // 串口打印可能阻塞前台，但不会影响定时器/ADC 里的闭环调度
         Vofa_PrintDebugFrame();
-
-        // 手动测试 MT6701 角度读取
-//      MT6701_Start_DMA_Read();
-//      printf("%.2f\n", encoder_angle);
-//      HAL_Delay(100);
 
         // 当前模式由 SEP_FOC_STARTUP_MODE 决定，也可以后续用串口 M0~n 切换
         // 串口输入 Fxxx 时，motor_target_val 会按当前模式被解释成对应目标量

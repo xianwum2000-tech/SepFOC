@@ -4,6 +4,7 @@
 #include "adc.h"
 #include "MT6701.h"
 #include "SepFoc.h"
+#include "usart.h"
 
 // 电机速度在 main.c 中维护，这里只做只读引用用于调试输出。
 extern float motor_speed;
@@ -23,6 +24,7 @@ static volatile float vofa_debug_poscur_current_target = 0.0f;
 static volatile float vofa_debug_spcur_current_target = 0.0f;
 static volatile float vofa_debug_posvcur_speed_target = 0.0f;
 static volatile float vofa_debug_posvcur_current_target = 0.0f;
+static volatile VofaDebugView vofa_debug_view = VOFA_DEBUG_VIEW_DEFAULT;
 
 #define VOFA_TEXT_EVENT_QUEUE_SIZE    8U
 #define VOFA_TEXT_NAME_MAX_LEN        16U
@@ -35,7 +37,9 @@ typedef enum
     VOFA_TEXT_EVENT_MODE_ERR,
     VOFA_TEXT_EVENT_FUNC_OK,
     VOFA_TEXT_EVENT_FUNC_ERR,
-    VOFA_TEXT_EVENT_FUNC_VALUE
+    VOFA_TEXT_EVENT_FUNC_VALUE,
+    VOFA_TEXT_EVENT_VIEW_OK,
+    VOFA_TEXT_EVENT_VIEW_ERR
 } VofaTextEventType;
 
 typedef struct
@@ -86,32 +90,13 @@ static void Vofa_QueueTextEvent(VofaTextEventType type, long integer_value, cons
 }
 
 /**********************************************************************************************
- * @brief  根据当前控制模式，返回串口调试里应该显示的目标量
- * @param  mode: 当前控制模式
- * @return 目标值，单位由模式决定
- * @note   这个函数只负责给调试打印选“目标通道”，不参与控制计算。
+ * @brief  获取当前串口 F 命令写入的目标值
+ * @return 最近一次写入的 F 值
+ * @note   默认调试页直接回显用户输入的 F 值，这样和串口命令语义保持一致。
  *********************************************************************************************/
-static float Vofa_GetTargetByMode(SepFocControlMode mode)
+static float Vofa_GetCommandTarget(void)
 {
-    switch (mode)
-    {
-        case SEP_FOC_MODE_TORQUE_VOLTAGE:
-            return Sep_FOC_GetVoltageTorqueTarget();
-        case SEP_FOC_MODE_TORQUE_CURRENT:
-            return Sep_FOC_GetTorqueTarget();
-        case SEP_FOC_MODE_POSITION:
-        case SEP_FOC_MODE_POSITION_VELOCITY:
-        case SEP_FOC_MODE_POSITION_CURRENT:
-        case SEP_FOC_MODE_POSITION_VELOCITY_CURRENT:
-            return Sep_FOC_GetPositionTarget();
-        case SEP_FOC_MODE_VELOCITY:
-            return Sep_FOC_GetVelocityTarget();
-        case SEP_FOC_MODE_VELOCITY_CURRENT:
-            return Sep_FOC_GetVelocityCurrentTarget();
-        case SEP_FOC_MODE_DISABLED:
-        default:
-            return 0.0f;
-    }
+    return motor_target_val;
 }
 
 /**********************************************************************************************
@@ -138,7 +123,7 @@ void Vofa_Debug_Update(void)
         if (!vofa_debug_ready)
         {
             vofa_debug_mode = mode;
-            vofa_debug_target = Vofa_GetTargetByMode(mode);
+            vofa_debug_target = Vofa_GetCommandTarget();
             vofa_debug_speed_avg = sum_speed / (float)sample_count;
             vofa_debug_uq_avg = sum_uq / (float)sample_count;
             vofa_debug_iq_avg = sum_iq / (float)sample_count;
@@ -160,45 +145,23 @@ void Vofa_Debug_Update(void)
 }
 
 /**********************************************************************************************
- * @brief  将当前缓存好的调试窗口输出为 VOFA+ FireWater 文本帧
- * @note   固定输出 7 个通道，方便 VOFA+ 长期保持同一组通道映射。
+ * @brief  将当前缓存好的调试窗口按当前视图输出为 VOFA+ FireWater 文本帧
+ * @note   视图由串口 V0~V4 运行时切换，不再依赖编译期宏开关。
  *********************************************************************************************/
 void Vofa_PrintDebugFrame(void)
 {
     SepFocControlMode mode = SEP_FOC_MODE_DISABLED;
+    VofaDebugView view = VOFA_DEBUG_VIEW_DEFAULT;
     float target = 0.0f;
-#if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVEL_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSCUR_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_SPCUR_DATA)
     float uq_avg = 0.0f;
-#endif
-#if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA)
-    float speed_avg = 0.0f;
-    float iq_avg = 0.0f;
-    uint32_t sample_count = 0U;
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVEL_DATA)
-    float speed_avg = 0.0f;
-    float posvel_speed_target = 0.0f;
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSCUR_DATA)
-    float iq_avg = 0.0f;
-    float poscur_current_target = 0.0f;
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_SPCUR_DATA)
-    float speed_avg = 0.0f;
-    float iq_avg = 0.0f;
-    float spcur_current_target = 0.0f;
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVCUR_DATA)
     float speed_avg = 0.0f;
     float iq_avg = 0.0f;
     float angle_now = 0.0f;
+    float posvel_speed_target = 0.0f;
+    float poscur_current_target = 0.0f;
+    float spcur_current_target = 0.0f;
     float posvcur_speed_target = 0.0f;
     float posvcur_current_target = 0.0f;
-#endif
-#if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVEL_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSCUR_DATA)
-    float angle_now = 0.0f;
-#endif
     uint32_t primask = __get_PRIMASK();
 
     if (!vofa_debug_ready)
@@ -208,103 +171,108 @@ void Vofa_PrintDebugFrame(void)
 
     __disable_irq();
     mode = vofa_debug_mode;
+    view = vofa_debug_view;
     target = vofa_debug_target;
-#if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVEL_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSCUR_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_SPCUR_DATA)
     uq_avg = vofa_debug_uq_avg;
-#endif
-#if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA)
     speed_avg = vofa_debug_speed_avg;
     iq_avg = vofa_debug_iq_avg;
-    sample_count = vofa_debug_samples;
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVEL_DATA)
-    speed_avg = vofa_debug_speed_avg;
+    angle_now = vofa_debug_angle;
     posvel_speed_target = vofa_debug_posvel_speed_target;
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSCUR_DATA)
-    iq_avg = vofa_debug_iq_avg;
     poscur_current_target = vofa_debug_poscur_current_target;
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_SPCUR_DATA)
-    speed_avg = vofa_debug_speed_avg;
-    iq_avg = vofa_debug_iq_avg;
     spcur_current_target = vofa_debug_spcur_current_target;
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVCUR_DATA)
-    speed_avg = vofa_debug_speed_avg;
-    iq_avg = vofa_debug_iq_avg;
     posvcur_speed_target = vofa_debug_posvcur_speed_target;
     posvcur_current_target = vofa_debug_posvcur_current_target;
-#endif
-#if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVEL_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSCUR_DATA) || \
-    (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVCUR_DATA)
-    angle_now = vofa_debug_angle;
-#endif
     vofa_debug_ready = 0U;
     if (!primask)
     {
         __enable_irq();
     }
 
-#if (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_FULL_DATA)
-    // VOFA+ FireWater 通道顺序（全量调试）：
-    // ch0=mode，ch1=target，ch2=speed，ch3=Uq，ch4=Iq，ch5=angle，ch6=sample_count
-    printf("%u,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f,%lu\r\n",
-           (unsigned int)mode,               // ch0: 当前控制模式编号
-           target,                           // ch1: 当前模式对应的目标量
-           speed_avg,                        // ch2: 实际平均速度，单位 rad/s
-           uq_avg,                           // ch3: 当前控制器输出的平均 Uq，单位 V
-           iq_avg,                           // ch4: 实际平均 Iq，单位 A
-           angle_now,                        // ch5: 当前绝对角度，单位度，范围 0~360
-           (unsigned long)sample_count);     // ch6: 本次统计窗口累积的采样点数
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVEL_DATA)
-    // VOFA+ FireWater 通道顺序（位置-速度串级调试）：
-    // ch0=mode，ch1=target_angle，ch2=angle_now，ch3=angle_error，ch4=outer_speed_target，ch5=speed，ch6=Uq
-    printf("%u,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f\r\n",
-           (unsigned int)mode,                           // ch0: 当前控制模式编号
-           target,                                       // ch1: 目标绝对角度，单位度
-           angle_now,                                    // ch2: 当前绝对角度，单位度
-           cycle_diff(target - angle_now, 360.0f),       // ch3: 角度误差，单位度，取最短路径
-           posvel_speed_target,                          // ch4: 外环给出的速度目标，单位 rad/s
-           speed_avg,                                    // ch5: 实际平均速度，单位 rad/s
-           uq_avg);                                      // ch6: 速度环输出的平均 Uq，单位 V
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSCUR_DATA)
-    // VOFA+ FireWater 通道顺序（位置-电流串级调试）：
-    // ch0=mode，ch1=target_angle，ch2=angle_now，ch3=angle_error，ch4=iq_target，ch5=iq，ch6=Uq
-    printf("%u,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f\r\n",
-           (unsigned int)mode,                           // ch0: 当前控制模式编号
-           target,                                       // ch1: 目标绝对角度，单位度
-           angle_now,                                    // ch2: 当前绝对角度，单位度
-           cycle_diff(target - angle_now, 360.0f),       // ch3: 角度误差，单位度，取最短路径
-           poscur_current_target,                        // ch4: 外环给出的目标电流，单位 A
-           iq_avg,                                       // ch5: 实际平均 Iq，单位 A
-           uq_avg);                                      // ch6: 电流环输出的平均 Uq，单位 V
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_SPCUR_DATA)
-    // VOFA+ FireWater 通道顺序（速度-电流串级调试）：
-    // ch0=mode，ch1=target_speed，ch2=speed_now，ch3=speed_error，ch4=iq_target，ch5=iq，ch6=Uq
-    printf("%u,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f\r\n",
-           (unsigned int)mode,                           // ch0: 当前控制模式编号
-           target,                                       // ch1: 目标速度，单位 rad/s
-           speed_avg,                                    // ch2: 实际平均速度，单位 rad/s
-           (target - speed_avg),                         // ch3: 速度误差，单位 rad/s
-           spcur_current_target,                         // ch4: 外环给出的目标电流，单位 A
-           iq_avg,                                       // ch5: 实际平均 Iq，单位 A
-           uq_avg);                                      // ch6: 电流环输出的平均 Uq，单位 V
-#elif (VOFA_DEBUG_PRINT_TYPE == VOFA_DEBUG_PRINT_POSVCUR_DATA)
-    // VOFA+ FireWater 通道顺序（三环调试）：
-    // ch0=mode，ch1=target_angle，ch2=angle_now，ch3=speed_target，ch4=speed_now，ch5=iq_target，ch6=iq
-    printf("%u,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f\r\n",
-           (unsigned int)mode,                           // ch0: 当前控制模式编号
-           target,                                       // ch1: 目标绝对角度，单位度
-           angle_now,                                    // ch2: 当前绝对角度，单位度
-           posvcur_speed_target,                         // ch3: 最外环位置 PID 给出的速度目标，单位 rad/s
-           speed_avg,                                    // ch4: 实际平均速度，单位 rad/s
-           posvcur_current_target,                       // ch5: 中间速度环给出的目标电流，单位 A
-           iq_avg);                                      // ch6: 实际平均 Iq，单位 A
-#else
-#error "Unsupported VOFA_DEBUG_PRINT_TYPE"
-#endif
+    (void)mode;
+
+    switch (view)
+    {
+        case VOFA_DEBUG_VIEW_DEFAULT:
+            // V0: F值/速度/Iq/Uq/绝对角度
+            printf("%+.4f,%+.4f,%+.4f,%+.4f,%+.4f\r\n",
+                   target,
+                   speed_avg,
+                   iq_avg,
+                   uq_avg,
+                   angle_now);
+            break;
+        case VOFA_DEBUG_VIEW_POSVEL:
+            // V1: 位置-速度串级
+            printf("%+.4f,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f\r\n",
+                   target,
+                   angle_now,
+                   cycle_diff(target - angle_now, 360.0f),
+                   posvel_speed_target,
+                   speed_avg,
+                   uq_avg);
+            break;
+        case VOFA_DEBUG_VIEW_POSCUR:
+            // V2: 位置-电流串级
+            printf("%+.4f,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f\r\n",
+                   target,
+                   angle_now,
+                   cycle_diff(target - angle_now, 360.0f),
+                   poscur_current_target,
+                   iq_avg,
+                   uq_avg);
+            break;
+        case VOFA_DEBUG_VIEW_SPCUR:
+            // V3: 速度-电流串级
+            printf("%+.4f,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f\r\n",
+                   target,
+                   speed_avg,
+                   (target - speed_avg),
+                   spcur_current_target,
+                   iq_avg,
+                   uq_avg);
+            break;
+        case VOFA_DEBUG_VIEW_POSVCUR:
+            // V4: 位置-速度-电流三环
+            printf("%+.4f,%+.4f,%+.4f,%+.4f,%+.4f,%+.4f\r\n",
+                   target,
+                   angle_now,
+                   posvcur_speed_target,
+                   speed_avg,
+                   posvcur_current_target,
+                   iq_avg);
+            break;
+        default:
+            printf("%+.4f,%+.4f,%+.4f,%+.4f,%+.4f\r\n",
+                   target,
+                   speed_avg,
+                   iq_avg,
+                   uq_avg,
+                   angle_now);
+            break;
+    }
+}
+
+/**********************************************************************************************
+ * @brief  设置当前 VOFA 调试视图
+ * @param  view: 需要切换到的视图编号
+ *********************************************************************************************/
+void Vofa_SetDebugView(VofaDebugView view)
+{
+    if (view >= VOFA_DEBUG_VIEW_COUNT)
+    {
+        view = VOFA_DEBUG_VIEW_DEFAULT;
+    }
+
+    vofa_debug_view = view;
+}
+
+/**********************************************************************************************
+ * @brief  获取当前 VOFA 调试视图
+ * @return 当前调试视图编号
+ *********************************************************************************************/
+VofaDebugView Vofa_GetDebugView(void)
+{
+    return vofa_debug_view;
 }
 
 /**********************************************************************************************
@@ -348,6 +316,12 @@ void Vofa_ProcessPendingTextFrame(void)
             break;
         case VOFA_TEXT_EVENT_FUNC_VALUE:
             Vofa_PrintFunctionValueUpdate(event.name, event.float_value);
+            break;
+        case VOFA_TEXT_EVENT_VIEW_OK:
+            Vofa_PrintDebugViewSwitchOk((uint32_t)event.integer_value);
+            break;
+        case VOFA_TEXT_EVENT_VIEW_ERR:
+            Vofa_PrintDebugViewSwitchError(event.integer_value);
             break;
         case VOFA_TEXT_EVENT_NONE:
         default:
@@ -520,4 +494,65 @@ void Vofa_PrintFunctionValueUpdate(const char *name, float value)
 void Vofa_RequestFunctionValueUpdate(const char *name, float value)
 {
     Vofa_QueueTextEvent(VOFA_TEXT_EVENT_FUNC_VALUE, 0L, name, value);
+}
+
+/**********************************************************************************************
+ * @brief  输出 VOFA 调试视图切换成功回显
+ * @param  view: 视图编号，和串口 V0~V4 一一对应
+ *********************************************************************************************/
+void Vofa_PrintDebugViewSwitchOk(uint32_t view)
+{
+    const char *view_name = "Unknown";
+
+    switch ((VofaDebugView)view)
+    {
+        case VOFA_DEBUG_VIEW_DEFAULT:
+            view_name = "Default";
+            break;
+        case VOFA_DEBUG_VIEW_POSVEL:
+            view_name = "PosVel";
+            break;
+        case VOFA_DEBUG_VIEW_POSCUR:
+            view_name = "PosCur";
+            break;
+        case VOFA_DEBUG_VIEW_SPCUR:
+            view_name = "SpCur";
+            break;
+        case VOFA_DEBUG_VIEW_POSVCUR:
+            view_name = "PosVelCur";
+            break;
+        default:
+            break;
+    }
+
+    printf("# VOFA OK: V%lu -> %s\r\n", (unsigned long)view, view_name);
+}
+
+/**********************************************************************************************
+ * @brief  请求缓存 VOFA 调试视图切换成功信息
+ * @param  view: 需要回显的视图编号
+ *********************************************************************************************/
+void Vofa_RequestDebugViewSwitchOk(uint32_t view)
+{
+    Vofa_QueueTextEvent(VOFA_TEXT_EVENT_VIEW_OK, (long)view, NULL, 0.0f);
+}
+
+/**********************************************************************************************
+ * @brief  输出非法 VOFA 调试视图编号回显
+ * @param  view: 用户输入的非法视图编号
+ *********************************************************************************************/
+void Vofa_PrintDebugViewSwitchError(long view)
+{
+    printf("# VOFA ERR: V%ld out of range [0,%d]\r\n",
+           view,
+           (int)(VOFA_DEBUG_VIEW_COUNT - 1));
+}
+
+/**********************************************************************************************
+ * @brief  请求缓存非法 VOFA 调试视图错误信息
+ * @param  view: 用户输入的非法视图编号
+ *********************************************************************************************/
+void Vofa_RequestDebugViewSwitchError(long view)
+{
+    Vofa_QueueTextEvent(VOFA_TEXT_EVENT_VIEW_ERR, view, NULL, 0.0f);
 }

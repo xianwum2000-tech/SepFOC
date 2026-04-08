@@ -198,6 +198,7 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* adcHandle)
 // 三相电流配置采样时间 = ADC_SAMPLETIME_47CYCLES_5 对应 转换时间 = (47.5+12.5)/(150M/4）= 1.6us
 
 #include "arm_math.h"   // ARM DSP库（针对arm架构优化的数学库），提供sin/cos/park等函数
+#include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <config.h>
@@ -223,6 +224,88 @@ uint8_t over_curr_cnt_ins = 0; // 瞬间大电流过流计数
 float i_u_filt = 0, i_v_filt = 0, i_bus_filt = 0;
 uint32_t adc_offset_u = 2048, adc_offset_v = 2048, adc_offset_bus = 2048;
 
+#define ADC_OVERCURRENT_CONT_THRESHOLD_A   (MAX_CURRENT * 1.10f)
+#define ADC_OVERCURRENT_INST_THRESHOLD_A   (MAX_CURRENT * 1.60f)
+#define ADC_OVERCURRENT_CONT_COUNT_LIMIT   8U
+#define ADC_OVERCURRENT_INST_COUNT_LIMIT   1U
+
+static volatile uint8_t over_current_trip_latched = 0U;
+static volatile uint8_t over_current_shutdown_done = 0U;
+
+/**********************************************************************************************
+ * @brief  过流检测
+ * @param  i_u_raw/i_v_raw: 本次 ADC 转换得到的两相原始电流
+ * @note   瞬时过流用原始电流判断，持续过流用滤波电流判断；任一条件满足就锁存保护标志。
+ *********************************************************************************************/
+static void Over_Current_Detect(float i_u_raw, float i_v_raw)
+{
+    float i_w_raw = -(i_u_raw + i_v_raw);
+    float i_w_filt = -(i_u_filt + i_v_filt);
+    float inst_abs_max = fabsf(i_u_raw);
+    float cont_abs_max = fabsf(i_u_filt);
+
+    if (fabsf(i_v_raw) > inst_abs_max) inst_abs_max = fabsf(i_v_raw);
+    if (fabsf(i_w_raw) > inst_abs_max) inst_abs_max = fabsf(i_w_raw);
+
+    if (fabsf(i_v_filt) > cont_abs_max) cont_abs_max = fabsf(i_v_filt);
+    if (fabsf(i_w_filt) > cont_abs_max) cont_abs_max = fabsf(i_w_filt);
+
+    if (inst_abs_max >= ADC_OVERCURRENT_INST_THRESHOLD_A)
+    {
+        if (over_curr_cnt_ins < 255U)
+        {
+            over_curr_cnt_ins++;
+        }
+    }
+    else
+    {
+        over_curr_cnt_ins = 0U;
+    }
+
+    if (cont_abs_max >= ADC_OVERCURRENT_CONT_THRESHOLD_A)
+    {
+        if (over_curr_cnt_con < 255U)
+        {
+            over_curr_cnt_con++;
+        }
+    }
+    else
+    {
+        over_curr_cnt_con = 0U;
+    }
+
+    if ((over_curr_cnt_ins >= ADC_OVERCURRENT_INST_COUNT_LIMIT) ||
+        (over_curr_cnt_con >= ADC_OVERCURRENT_CONT_COUNT_LIMIT))
+    {
+        over_current_trip_latched = 1U;
+    }
+}
+
+/**********************************************************************************************
+ * @brief  过流保护执行
+ * @note   一旦触发保护，就立即清目标、退出 Function 模式并切到 Disabled，后续快环不再继续输出。
+ *         当前是锁存型保护，目的是先把硬件安全放在第一位；如需串口解锁可以后面再加。
+ *********************************************************************************************/
+static void Over_Current_Protect(void)
+{
+    if (!over_current_trip_latched)
+    {
+        return;
+    }
+
+    if (over_current_shutdown_done)
+    {
+        return;
+    }
+
+    motor_target_val = 0.0f;
+    Function_Control_Disable();
+    Sep_FOC_SetControlMode(SEP_FOC_MODE_DISABLED);
+    setTorque(0.0f, _electricalAngle());
+
+    over_current_shutdown_done = 1U;
+}
+
 
 
 // ADC DMA传输完成回调函数 ***********************************************************************************
@@ -233,111 +316,39 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     {
 
 		// 根据电路，电流计算公式 Vadc = 1.65+0.01*I*50
-   	    float u_1 = ADC_VOLTAGE * ((float)(adc1_buf[0]) / (ADC_RESOLUTION - 1) - 0.5f);
-   	    float u_2 = ADC_VOLTAGE * ((float)(adc1_buf[1]) / (ADC_RESOLUTION - 1) - 0.5f);
-   	    float i_1 = u_1 / R_SHUNT / OP_GAIN + MOTOR_I_U_CORRECT;
-   	    float i_2 = u_2 / R_SHUNT / OP_GAIN + MOTOR_I_V_CORRECT;
+		float u_1 = ADC_VOLTAGE * ((float)(adc1_buf[0]) / (ADC_RESOLUTION - 1) - 0.5f);
+		float u_2 = ADC_VOLTAGE * ((float)(adc1_buf[1]) / (ADC_RESOLUTION - 1) - 0.5f);
+		float i_1 = u_1 / R_SHUNT / OP_GAIN + MOTOR_I_U_CORRECT;
+		float i_2 = u_2 / R_SHUNT / OP_GAIN + MOTOR_I_V_CORRECT;
 		
 		// 滑动均值滤波
 		Current_Slide_Filter(i_1, i_2);
-
-//      // 过流检测（带延时确认）
-//      Over_Current_Detect(); 
-//      // 过流保护执行
-//      Over_Current_Protect();
 
 		motor_i_u = i_u_filt;                  // 对应MA
 		motor_i_v = i_v_filt;                  // 对应MB
 		motor_i_w = -(motor_i_u + motor_i_v);  // 对应MC
 
-        // Function 模块启用时，由它接管快环输出；否则继续走原有 FOC 快环。
-        if (Function_Control_IsEnabled())
-        {
-            Function_Control_RunFastLoop();
-        }
-        else
-        {
-            // 电流环模式下，Q 轴电流环与采样节拍同步执行
-            Sep_FOC_RunFastLoop(motor_target_val);
-        }
+		// 过流检测与保护必须放在控制输出之前，避免本次采样已经超限却还继续下发新的 PWM
+		Over_Current_Detect(i_1, i_2);
+		Over_Current_Protect();
+		if (over_current_trip_latched)
+		{
+			HAL_ADC_Start_DMA(hadc, (uint32_t*)adc1_buf, ADC1_CH_NUM);
+			return;
+		}
 
-      // 测试
-      // motor_i_u = i_1;                  
-      // motor_i_v = i_2;                 
-      // motor_i_w = -(motor_i_u + motor_i_v); 
-      // motor_i_bus = i_3;  
+		// Function 模块启用时，由它接管快环输出；否则继续走原有 FOC 快环。
+		if (Function_Control_IsEnabled())
+		{
+			Function_Control_RunFastLoop();
+		}
+		else
+		{
+			// 电流环模式下，Q 轴电流环与采样节拍同步执行
+			Sep_FOC_RunFastLoop(motor_target_val);
+		}
 
-//      float i_alpha = 0;
-//      float i_beta = 0;
-//      // 克拉克变换
-//      // i_alpha = i_u
-//      // i_beta  = (1/sqrt(3)) * i_u + (2/sqrt(3)) * i_v
-//      arm_clarke_f32(motor_i_u, motor_i_v, &i_alpha, &i_beta);
-
-//      float sin_value = arm_sin_f32(rotor_electrical_angle);
-//      float cos_value = arm_cos_f32(rotor_electrical_angle);
-//      float _motor_i_d = 0;
-//      float _motor_i_q = 0;
-//      // 帕克变换
-//      // id ?= iα * ?cosθ + iβ * ?sinθ
-//      // iq ?= ?iα * ?sinθ + iβ * ?cosθ
-//      // i_d：直轴电流（励磁电流），控制电机磁链，FOC 通常设为 0（弱磁控制除外）
-//      // i_q：交轴电流（转矩电流），直接决定电机输出转矩，是转速环的控制目标
-//      arm_park_f32(i_alpha, i_beta, &_motor_i_d, &_motor_i_q, sin_value, cos_value);
-
-//      // 一阶低通滤波
-//      motor_i_d = low_pass_filter(_motor_i_d, motor_i_d, i_d_low_pass_filter_alpha);
-//      motor_i_q = low_pass_filter(_motor_i_q, motor_i_q, i_q_low_pass_filter_alpha);
-
-      // //printf("pos:%.2f, speed:%.2f, electrical_angle:%.2f \r\n", cumulative_encoder_angle, motor_speed, rotor_electrical_angle);   
-      // //printf("target_position:%.2f, target_speed:%.2f \r\n", motor_control_context.position, motor_control_context.speed);
-
-
-//      // 运行电机相应闭环控制
-//      switch (motor_control_context.type)
-//      {
-//        case control_type_null:
-//          set_pwm_duty(0, 0, 0, 0.9f);
-//          pid_i_reset();
-//          break;
-//        case control_type_position:
-//          set_motor_pid_single(&pid_position, Position_P, Position_I, Position_D);
-//          lib_position_control(motor_control_context.position);
-//          break;
-//        case control_type_speed:
-//          set_motor_pid_single(&pid_speed, Speed_P, Speed_I, Speed_D);
-//          lib_speed_control(motor_control_context.speed);
-//          break;
-//        case control_type_torque:
-//          set_motor_pid_single(&pid_torque_q, Torque_Q_P, Torque_Q_I, Torque_Q_D);
-//          lib_torque_control(motor_control_context.current_d, motor_control_context.current_q);
-//          break;
-//        case control_type_position_speed:
-//          set_motor_pid_single(&pid_position_PS_Ctrl, Position_P, Position_I, Position_D);
-//          set_motor_pid_single(&pid_speed_PS_Ctrl, Speed_P, Speed_I, Speed_D);
-//          lib_position_speed_control(motor_control_context.position, motor_control_context.speed);
-//          break;
-//        case control_type_position_torque:
-//          set_motor_pid_single(&pid_position_PT_Ctrl, Position_P, Position_I, Position_D);
-//          set_motor_pid_single(&pid_torque_q_PT_Ctrl, Torque_Q_P, Torque_Q_I, Torque_Q_D);
-//          lib_position_torque_control(motor_control_context.position, motor_control_context.current_q);
-//          break;
-//        case control_type_speed_torque:
-//          set_motor_pid_single(&pid_speed_ST_Ctrl, Speed_P, Speed_I, Speed_D);
-//          set_motor_pid_single(&pid_torque_q_ST_Ctrl, Torque_Q_P, Torque_Q_I, Torque_Q_D);
-//          lib_speed_torque_control(motor_control_context.speed, motor_control_context.current_q);
-//          break;
-//        case control_type_position_speed_torque:
-//          set_motor_pid_single(&pid_position_PST_Ctrl, Position_P, Position_I, Position_D);
-//          set_motor_pid_single(&pid_speed_PST_Ctrl, Speed_P, Speed_I, Speed_D);
-//          set_motor_pid_single(&pid_torque_q_PST_Ctrl, Torque_Q_P, Torque_Q_I, Torque_Q_D);
-//          lib_position_speed_torque_control(motor_control_context.position, motor_control_context.speed, motor_control_context.current_q);
-//          break;
-//        default:
-//          break;
-//      }
-
-      HAL_ADC_Start_DMA(hadc, (uint32_t*)adc1_buf, ADC1_CH_NUM);  //开启下一次
+		HAL_ADC_Start_DMA(hadc, (uint32_t*)adc1_buf, ADC1_CH_NUM);  //开启下一次
     }
 }
 
