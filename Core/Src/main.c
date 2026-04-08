@@ -12,6 +12,7 @@
 #include "MT6701.h"
 #include "Config.h"
 #include "kalman_filter.h"
+#include "SensorlessFOC.h"
 #include "SepFoc.h"
 #include "Vofa.h"
 
@@ -42,6 +43,8 @@ int main(void)
     kalman_filter_init(&motor_speed_kalman_filter, KF_R, KF_Q);
     // 初始化 FOC 数据结构
     FOC_Data_Init(&FOC);
+    // 初始化无感 FOC 默认参数，后续 W0~n 切换时从统一默认值起步
+    Sensorless_FOC_ResetConfigsToDefault();
 	
     // 启动 PWM 输出
     PWM_Start();
@@ -61,7 +64,7 @@ int main(void)
     HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc1_buf, ADC1_CH_NUM);
 
     // 初始化串口接收：
-    // Fxxx 表示给当前模式写统一目标值，M0~n 表示切换控制模式
+    // Fxxx 表示给当前模式写统一目标值，M0~n / W0~n / X0~n 分别切换有感/无感/功能模式
     USART3_Rx_Init();
 
     // 启动速度计算定时器
@@ -100,7 +103,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     {
         static float encoder_angle_last = 0.0f;   // 存储上一次编码器角度
         static uint8_t slow_loop_div_cnt = 0U;
+        static uint8_t sensorless_slow_loop_div_cnt = 0U;
         uint8_t slow_loop_div = 0U;
+        uint8_t sensorless_slow_loop_div = 0U;
 
         // 限制编码器角度范围，防止异常值影响速度计算
         encoder_angle = min(encoder_angle, 2 * PI);
@@ -130,20 +135,45 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         // 在中断里做轻量级调试量累计，打印仍留在主循环里做
         Vofa_Debug_Update();
 
-        // 根据当前模式决定是否执行慢环，以及慢环的固定周期
-        slow_loop_div = Sep_FOC_GetSlowLoopDivider();
-        if (slow_loop_div > 0U)
+        // 无感模式启用时，TIM7 只调度无感状态机/速度外环；否则继续走原有 FOC 慢环。
+        if (Sensorless_FOC_IsEnabled())
         {
-            slow_loop_div_cnt++;
-            if (slow_loop_div_cnt >= slow_loop_div)
+            sensorless_slow_loop_div = Sensorless_FOC_GetSlowLoopDivider();
+            if (sensorless_slow_loop_div > 0U)
             {
-                slow_loop_div_cnt = 0U;
-                Sep_FOC_RunSlowLoop(motor_target_val);
+                sensorless_slow_loop_div_cnt++;
+                if (sensorless_slow_loop_div_cnt >= sensorless_slow_loop_div)
+                {
+                    sensorless_slow_loop_div_cnt = 0U;
+                    Sensorless_FOC_RunSlowLoop(motor_target_val);
+                }
             }
+            else
+            {
+                sensorless_slow_loop_div_cnt = 0U;
+            }
+
+            slow_loop_div_cnt = 0U;
         }
         else
         {
-            slow_loop_div_cnt = 0U;
+            sensorless_slow_loop_div_cnt = 0U;
+
+            // 根据当前模式决定是否执行慢环，以及慢环的固定周期
+            slow_loop_div = Sep_FOC_GetSlowLoopDivider();
+            if (slow_loop_div > 0U)
+            {
+                slow_loop_div_cnt++;
+                if (slow_loop_div_cnt >= slow_loop_div)
+                {
+                    slow_loop_div_cnt = 0U;
+                    Sep_FOC_RunSlowLoop(motor_target_val);
+                }
+            }
+            else
+            {
+                slow_loop_div_cnt = 0U;
+            }
         }
 
         // 如有需要，也可以在这里再次触发一次角度采样

@@ -194,33 +194,34 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* adcHandle)
 /********************************************************************************************************************/
 /********************************************************************************************************************/
 
-// 在stm32g431里，转换时间 = 采样时间 + 12.5个ADC时钟周期(cubemx配置为150MHz4分频)
-// 三相电流配置采样时间 = ADC_SAMPLETIME_47CYCLES_5 对应 转换时间 = (47.5+12.5)/(150M/4）= 1.6us
+// STM32G431 的 ADC 转换时间 = 采样周期 + 12.5 个 ADC 时钟周期。
+// 当前配置下采样时间为 ADC_SAMPLETIME_47CYCLES_5，折算单次转换时间约 1.6 us。
 
-#include "arm_math.h"   // ARM DSP库（针对arm架构优化的数学库），提供sin/cos/park等函数
+#include "arm_math.h"   // ARM DSP 数学库，后续可用于滤波或坐标变换等运算。
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <config.h>
+#include "SensorlessFOC.h"
 #include "SepFoc.h"
 #include "usart.h"
 #include "Vofa.h"
 
-uint16_t adc1_buf[ADC1_CH_NUM] = {0};  // ADC1-三相电流采样值
-float motor_i_u = 0;          // W 相采样电流，安培
-float motor_i_v = 0;          // V 相采样电流，安培
-float motor_i_w = 0;          // W 相采样电流，安培
-float motor_i_bus = 0;        // 低侧总线电流，安培
+uint16_t adc1_buf[ADC1_CH_NUM] = {0};  // ADC1 DMA 原始采样缓冲区
+float motor_i_u = 0;          // U 相滤波电流
+float motor_i_v = 0;          // V 相滤波电流
+float motor_i_w = 0;          // W 相重构电流
+float motor_i_bus = 0;        // 母线电流，当前未使用
 
 
-// 滑动均值滤波缓冲区
+// 相电流滑动平均滤波缓存
 float i_u_filter_buf[FILTER_TIMES] = {0};
 float i_v_filter_buf[FILTER_TIMES] = {0};
 float i_bus_filter_buf[FILTER_TIMES] = {0};
-uint8_t filter_index = 0;  // 滤波缓冲区索引（循环覆盖）
-uint8_t over_curr_cnt_con = 0; // 持续过流计数（连续超过阈值的次数）
-uint8_t over_curr_cnt_ins = 0; // 瞬间大电流过流计数
-// 滤波后的电流值
+uint8_t filter_index = 0;  // 当前滑动窗口写入位置
+uint8_t over_curr_cnt_con = 0; // 持续过流计数
+uint8_t over_curr_cnt_ins = 0; // 瞬时过流计数
+// 当前滤波结果与 ADC 零点
 float i_u_filt = 0, i_v_filt = 0, i_bus_filt = 0;
 uint32_t adc_offset_u = 2048, adc_offset_v = 2048, adc_offset_bus = 2048;
 
@@ -234,8 +235,8 @@ static volatile uint8_t over_current_shutdown_done = 0U;
 
 /**********************************************************************************************
  * @brief  过流检测
- * @param  i_u_raw/i_v_raw: 本次 ADC 转换得到的两相原始电流
- * @note   瞬时过流用原始电流判断，持续过流用滤波电流判断；任一条件满足就锁存保护标志。
+ * @param  i_u_raw/i_v_raw: 当前 ADC 换算得到的两相原始电流
+ * @note   瞬时过流使用原始电流判定，持续过流使用滤波电流判定，任一满足都会锁存保护。
  *********************************************************************************************/
 static void Over_Current_Detect(float i_u_raw, float i_v_raw)
 {
@@ -282,9 +283,9 @@ static void Over_Current_Detect(float i_u_raw, float i_v_raw)
 }
 
 /**********************************************************************************************
- * @brief  过流保护执行
- * @note   一旦触发保护，就立即清目标、退出 Function 模式并切到 Disabled，后续快环不再继续输出。
- *         当前是锁存型保护，目的是先把硬件安全放在第一位；如需串口解锁可以后面再加。
+ * @brief  执行过流保护
+ * @note   触发后统一拉低目标值、关闭 Function 模式、停用有感主控并给无感注入过流故障。
+ *         这是锁存式保护，除非手动清除，否则不会自动恢复输出。
  *********************************************************************************************/
 static void Over_Current_Protect(void)
 {
@@ -300,35 +301,56 @@ static void Over_Current_Protect(void)
 
     motor_target_val = 0.0f;
     Function_Control_Disable();
+    Sensorless_FOC_ForceFault(SENSORLESS_FAULT_OVERCURRENT);
     Sep_FOC_SetControlMode(SEP_FOC_MODE_DISABLED);
     setTorque(0.0f, _electricalAngle());
 
     over_current_shutdown_done = 1U;
 }
 
+/**********************************************************************************************
+ * @brief  清除过流锁存
+ * @note   用于串口 C0 或上层调试恢复；只清状态，不主动恢复任何控制模式。
+ *********************************************************************************************/
+void ADC_ClearOverCurrentLatch(void)
+{
+    over_curr_cnt_con = 0U;
+    over_curr_cnt_ins = 0U;
+    over_current_trip_latched = 0U;
+    over_current_shutdown_done = 0U;
+}
+
+/**********************************************************************************************
+ * @brief  查询当前是否存在过流锁存
+ *********************************************************************************************/
+uint8_t ADC_GetOverCurrentLatched(void)
+{
+    return over_current_trip_latched;
+}
 
 
-// ADC DMA传输完成回调函数 ***********************************************************************************
-// 获得3相电流，通过克拉克变换、帕克变换得到 d/q 轴电流
+
+// ADC DMA 采样完成回调
+// 在这里完成电流换算、滤波、保护判断以及快环调度
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1)
     {
 
-		// 根据电路，电流计算公式 Vadc = 1.65+0.01*I*50
+		// 把 ADC 采样值换算为相电流，运放链路近似满足 Vadc = 1.65 + 0.01 * I * 50
 		float u_1 = ADC_VOLTAGE * ((float)(adc1_buf[0]) / (ADC_RESOLUTION - 1) - 0.5f);
 		float u_2 = ADC_VOLTAGE * ((float)(adc1_buf[1]) / (ADC_RESOLUTION - 1) - 0.5f);
 		float i_1 = u_1 / R_SHUNT / OP_GAIN + MOTOR_I_U_CORRECT;
 		float i_2 = u_2 / R_SHUNT / OP_GAIN + MOTOR_I_V_CORRECT;
 		
-		// 滑动均值滤波
+		// 更新相电流滑动平均结果
 		Current_Slide_Filter(i_1, i_2);
 
-		motor_i_u = i_u_filt;                  // 对应MA
-		motor_i_v = i_v_filt;                  // 对应MB
-		motor_i_w = -(motor_i_u + motor_i_v);  // 对应MC
+		motor_i_u = i_u_filt;                  // 实测 U 相
+		motor_i_v = i_v_filt;                  // 实测 V 相
+		motor_i_w = -(motor_i_u + motor_i_v);  // 由两相重构 W 相
 
-		// 过流检测与保护必须放在控制输出之前，避免本次采样已经超限却还继续下发新的 PWM
+		// 先做保护，再决定本次快环是否继续输出 PWM
 		Over_Current_Detect(i_1, i_2);
 		Over_Current_Protect();
 		if (over_current_trip_latched)
@@ -337,27 +359,31 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 			return;
 		}
 
-		// Function 模块启用时，由它接管快环输出；否则继续走原有 FOC 快环。
-		if (Function_Control_IsEnabled())
-		{
-			Function_Control_RunFastLoop();
-		}
+        // 快环调度优先级：无感 > Function 手感模式 > 原有有感 FOC
+        if (Sensorless_FOC_IsEnabled())
+        {
+            Sensorless_FOC_RunFastLoop(i_1, i_2, motor_i_u, motor_i_v);
+        }
+        else if (Function_Control_IsEnabled())
+        {
+            Function_Control_RunFastLoop();
+        }
 		else
 		{
-			// 电流环模式下，Q 轴电流环与采样节拍同步执行
+			// 默认有感 FOC 快环：继续运行当前模式对应的最内层控制
 			Sep_FOC_RunFastLoop(motor_target_val);
 		}
 
-		HAL_ADC_Start_DMA(hadc, (uint32_t*)adc1_buf, ADC1_CH_NUM);  //开启下一次
+		HAL_ADC_Start_DMA(hadc, (uint32_t*)adc1_buf, ADC1_CH_NUM);  // 重新挂起下一次 DMA 采样
     }
 }
 
-// ADC错误回调
+// ADC 错误回调
 void HAL_ADC_ErrorCallback(ADC_HandleTypeDef* hadc)
 {
     if(hadc->Instance == ADC1)
     {
-        // ADC 错误回显也改成前台打印，避免中断里等待串口发送
+        // 仅登记错误消息，避免在错误回调里直接阻塞串口
         Vofa_RequestAdcError(hadc->ErrorCode);
     }
     
@@ -368,46 +394,46 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef* hadc)
     }
 }
 
-// 滑动均值滤波,对三相电流做滑动均值滤波，输出平滑的电流值 ***************************************************
-// 滑动均值：每次新增一个采样值，剔除最旧的，计算平均值（兼顾实时性和滤波效果）
+// 电流滑动平均滤波
+// 用固定长度窗口抑制采样噪声，得到更稳定的相电流反馈
 static void Current_Slide_Filter(float i_u, float i_v)
 {
-    // 循环覆盖滤波缓冲区
+    // 写入最新采样
     i_u_filter_buf[filter_index] = i_u;
     i_v_filter_buf[filter_index] = i_v;
-    // 索引自增，超过次数则清零（循环）
+    // 更新循环缓冲索引
     filter_index = (filter_index + 1) % FILTER_TIMES;
     
-    // 计算滑动平均值
+    // 重新求窗口和
     float sum_u = 0, sum_v = 0;
     for (uint8_t i = 0; i < FILTER_TIMES; i++)
     {
         sum_u += i_u_filter_buf[i];
         sum_v += i_v_filter_buf[i];
     }
-    // 存储滤波后的电流值
+    // 输出平均值
     i_u_filt = sum_u / FILTER_TIMES;
     i_v_filt = sum_v / FILTER_TIMES;
 }
 
 
-// ADC DMA传输校准函数 ***********************************************************************************
-// 开机校准
+// 电流零点标定
+// 建议在 PWM 关闭、电机静止时调用
 void Motor_Current_Calibration(void)
 {
     uint32_t sum_u = 0, sum_v = 0, sum_bus = 0;
-    uint16_t sample_counts = 1024; // 采样1024次取平均，滤除高频噪声
+    uint16_t sample_counts = 1024; // 累计 1024 次采样作为零点基准
 
-    // 确保此时 PWM 为关闭状态，无电流流经电阻
+    // 逐次读取静态 ADC 结果并求平均
     for(int i = 0; i < sample_counts; i++)
     {
-        // 触发一次采样（取决于你的配置，如果是DMA循环模式直接读取即可）
+        // 这里直接等待下一次 DMA 刷新，简化零点标定流程
         HAL_Delay(1); 
         sum_u += adc1_buf[0];
         sum_v += adc1_buf[1];
     }
 
-    // 得到平均零点 Counts
+    // 保存零点 ADC 计数
     adc_offset_u = sum_u / sample_counts;
     adc_offset_v = sum_v / sample_counts;
     adc_offset_bus = sum_bus / sample_counts;

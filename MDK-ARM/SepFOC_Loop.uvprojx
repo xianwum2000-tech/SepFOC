@@ -787,6 +787,31 @@
               <FileType>5</FileType>
               <FilePath>..\Core\Hardware\Function.h</FilePath>
             </File>
+            <File>
+              <FileName>SensorlessConfig.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Hardware\SensorlessConfig.h</FilePath>
+            </File>
+            <File>
+              <FileName>BemfObserver.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Hardware\BemfObserver.c</FilePath>
+            </File>
+            <File>
+              <FileName>BemfObserver.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Hardware\BemfObserver.h</FilePath>
+            </File>
+            <File>
+              <FileName>SensorlessFOC.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Hardware\SensorlessFOC.c</FilePath>
+            </File>
+            <File>
+              <FileName>SensorlessFOC.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\Hardware\SensorlessFOC.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

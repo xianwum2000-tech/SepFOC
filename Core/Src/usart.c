@@ -22,6 +22,8 @@
 
 /* USER CODE BEGIN 0 */
 #include <stdlib.h>
+#include "adc.h"
+#include "SensorlessFOC.h"
 #include "SepFoc.h"
 #include "Vofa.h"
 
@@ -177,7 +179,7 @@ volatile uint8_t uart_tx_busy_p = 0;
 
 int fputc(int ch, FILE *f)
 {
-    // 如果上一帧 DMA 还没发完，这里会等待；不要在高频中断里使用 printf
+    // ??????? DMA ????????????????????????ж?????? printf
     while (uart_tx_busy_p); 
 
     if (uart_tx_len < sizeof(uart_tx_buf) - 2) {
@@ -185,7 +187,7 @@ int fputc(int ch, FILE *f)
         uart_tx_buf[uart_tx_len++] = ch;
     }
 
-    // 仅在遇到换行时启动一次 DMA，把当前缓存整包发出去
+    // ???????????????????? DMA???????????????????
     if (ch == '\n') {
         uart_tx_busy_p = 1;
         HAL_UART_Transmit_DMA(&huart3, uart_tx_buf, uart_tx_len);
@@ -196,31 +198,31 @@ int fputc(int ch, FILE *f)
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) 
 {
-    // 仅处理 USART3 的发送完成事件
+    // ?????? USART3 ???????????
     if (huart->Instance == USART3) 
     {
         uart_tx_busy_p = 0;
-        uart_tx_len = 0; // 清空发送缓冲区
+        uart_tx_len = 0; // ???????????
     }
 }
 
 
 
-// 串口控制相关变量
+// ?????????????
 volatile float motor_target_val = 0.0f;
-uint8_t g_rx_byte;                 // 接收单个字节的缓冲
-uint8_t temp_buf[20];              // 解析数字时的临时缓存
-uint8_t buf_idx = 0;               // 缓冲索引
-uint8_t start_flag = 0;            // 接收状态位
-uint8_t rx_cmd_type = 0;           // 当前接收命令类型：0=无，'F'=目标值，'M'=模式切换，'X'=Function 模式，'V'=VOFA视图
+uint8_t g_rx_byte;                 // ??????????????
+uint8_t temp_buf[20];              // ??????????????????
+uint8_t buf_idx = 0;               // ????????
+uint8_t start_flag = 0;            // ??????λ
+uint8_t rx_cmd_type = 0;           // ????????????????0=???'F'=??????'M'=???л???'W'=???????'X'=Function ????'V'=VOFA?????'C'=???????
 
 void USART3_Rx_Init(void)
 {
-    // 1. 清除所有可能的错误标志，防止一启动就进入错误状态
+    // 1. ??????п?????????????????????????????
     __HAL_UART_CLEAR_IT(&huart3, UART_CLEAR_OREF | UART_CLEAR_NEF | UART_CLEAR_FEF);
     
-    // 2. 开启单字节中断接收
-    // 每收到一个字符，都会进入 HAL_UART_RxCpltCallback
+    // 2. ??????????ж????
+    // ??????????????????? HAL_UART_RxCpltCallback
     HAL_UART_Receive_IT(&huart3, &g_rx_byte, 1);
 }
 
@@ -230,11 +232,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     {
         uint8_t ch = g_rx_byte;
 
-        // 串口协议：
-        // Fxxx -> 给当前模式写统一目标值，例如 F0.10 / F50
-        // Mx   -> 切换控制模式，模式编号顺序与 SepFocControlMode 保持一致
-        // Xx   -> 切换 Function 模式，X0=关闭，X1=纯阻尼感，X2=定格感
-        // Vx   -> 切换 VOFA 调试视图，V0~V4 对应不同调试页
+        // ????Э?飺
+        // Fxxx -> ???????д???????????? F0.10 / F50
+        // Mx   -> ?л??????????????????? SepFocControlMode ???????
+        // Wx   -> ?л??????????? W0=????????
+        // Xx   -> ?л? Function ????X0=????X1=??????У?X2=?????
+        // Vx   -> ?л? VOFA ?????????V0~V5 ???????????
+        // C0   -> ??????汣??????????????????????????′?У?????
         if(ch == 'F' || ch == 'f') {
             start_flag = 1;
             rx_cmd_type = 'F';
@@ -243,6 +247,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         else if(ch == 'M' || ch == 'm') {
             start_flag = 1;
             rx_cmd_type = 'M';
+            buf_idx = 0;
+        }
+        else if(ch == 'W' || ch == 'w') {
+            start_flag = 1;
+            rx_cmd_type = 'W';
             buf_idx = 0;
         }
         else if(ch == 'X' || ch == 'x') {
@@ -255,20 +264,25 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             rx_cmd_type = 'V';
             buf_idx = 0;
         }
+        else if(ch == 'C' || ch == 'c') {
+            start_flag = 1;
+            rx_cmd_type = 'C';
+            buf_idx = 0;
+        }
         else if(start_flag) {
             if(rx_cmd_type == 'F')
             {
-                // F 命令允许数字、小数点和负号进入缓冲
+                // F ?????????????С?????????????
                 if((ch >= '0' && ch <= '9') || ch == '.' || ch == '-') {
                     if(buf_idx < 18) {
                         temp_buf[buf_idx++] = ch;
                     }
                 }
-                // 收到回车换行后，把缓存转成浮点数
+                // ?????????к??????????????
                 else if(ch == '\r' || ch == '\n') {
                     if(buf_idx > 0) {
                         float value = 0.0f;
-                        temp_buf[buf_idx] = '\0'; // 字符串结束
+                        temp_buf[buf_idx] = '\0'; // ?????????
                         value = (float)atof((char*)temp_buf);
 
                         if(Function_Control_GetMode() == FUNCTION_CONTROL_PURE_DAMPING) {
@@ -277,7 +291,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                             Vofa_RequestFunctionValueUpdate("DampingKp", motor_target_val);
                         }
                         else if(Function_Control_GetMode() == FUNCTION_CONTROL_DETENT) {
-                            // X2 定格感模式下不接收 F 参数，直接忽略
+                            // X2 ????????2????? F ????????????
                         }
                         else {
                             motor_target_val = value;
@@ -290,7 +304,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             }
             else if(rx_cmd_type == 'M')
             {
-                // M 命令只接收整数模式编号
+                // M ??????????????????
                 if(ch >= '0' && ch <= '9') {
                     if(buf_idx < 18) {
                         temp_buf[buf_idx++] = ch;
@@ -304,9 +318,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                         mode_val = strtol((char*)temp_buf, NULL, 10);
                         if((mode_val >= 0) && (mode_val < (long)SEP_FOC_MODE_COUNT)) {
                             new_mode = (SepFocControlMode)mode_val;
+                            Sensorless_FOC_ResetConfigsToDefault();
+                            Sensorless_FOC_Disable();
                             Function_Control_ResetConfigsToDefault();
                             Function_Control_Disable();
-                            // 位置类模式默认锁当前位置，其余模式默认目标清零，避免切换瞬间误动作
+                            // λ??????????????λ????????????????????????л????????
                             motor_target_val = Sep_FOC_GetModeHoldTarget(new_mode);
                             Sep_FOC_SetControlMode(new_mode);
                             Vofa_RequestModeSwitchOk((uint32_t)mode_val);
@@ -320,9 +336,40 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                     buf_idx = 0;
                 }
             }
+            else if(rx_cmd_type == 'W')
+            {
+                // W ?????????????????????
+                if(ch >= '0' && ch <= '9') {
+                    if(buf_idx < 18) {
+                        temp_buf[buf_idx++] = ch;
+                    }
+                }
+                else if(ch == '\r' || ch == '\n') {
+                    if(buf_idx > 0) {
+                        long sensorless_mode = 0;
+                        temp_buf[buf_idx] = '\0';
+                        sensorless_mode = strtol((char*)temp_buf, NULL, 10);
+
+                        if((sensorless_mode >= 0) && (sensorless_mode < (long)SENSORLESS_CONTROL_MODE_COUNT)) {
+                            Function_Control_ResetConfigsToDefault();
+                            Function_Control_Disable();
+                            Sensorless_FOC_ResetConfigsToDefault();
+                            motor_target_val = Sensorless_FOC_GetModeHoldTarget((SensorlessControlMode)sensorless_mode);
+                            Sensorless_FOC_Enable((SensorlessControlMode)sensorless_mode);
+                            Vofa_RequestSensorlessSwitchOk((uint32_t)sensorless_mode);
+                        }
+                        else {
+                            Vofa_RequestSensorlessSwitchError(sensorless_mode);
+                        }
+                    }
+                    start_flag = 0;
+                    rx_cmd_type = 0;
+                    buf_idx = 0;
+                }
+            }
             else if(rx_cmd_type == 'X')
             {
-                // X 命令只接收整数功能模式编号
+                // X ??????????????????????
                 if(ch >= '0' && ch <= '9') {
                     if(buf_idx < 18) {
                         temp_buf[buf_idx++] = ch;
@@ -334,7 +381,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                         temp_buf[buf_idx] = '\0';
                         func_mode = strtol((char*)temp_buf, NULL, 10);
 
-                        // 每次进入或退出 X 模式前都恢复默认配置
+                        // ??ν??????? X ???????????????
+                        Sensorless_FOC_ResetConfigsToDefault();
+                        Sensorless_FOC_Disable();
                         Function_Control_ResetConfigsToDefault();
 
                         if(func_mode == 0) {
@@ -363,7 +412,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             }
             else if(rx_cmd_type == 'V')
             {
-                // V 命令只接收整数调试视图编号
+                // V ???????????????????????
                 if(ch >= '0' && ch <= '9') {
                     if(buf_idx < 18) {
                         temp_buf[buf_idx++] = ch;
@@ -388,9 +437,38 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                     buf_idx = 0;
                 }
             }
+            else if(rx_cmd_type == 'C')
+            {
+                if(ch >= '0' && ch <= '9') {
+                    if(buf_idx < 18) {
+                        temp_buf[buf_idx++] = ch;
+                    }
+                }
+                else if(ch == '\r' || ch == '\n') {
+                    if(buf_idx > 0) {
+                        long protect_cmd = 0;
+                        temp_buf[buf_idx] = '\0';
+                        protect_cmd = strtol((char*)temp_buf, NULL, 10);
+
+                        if(protect_cmd == 0) {
+                            ADC_ClearOverCurrentLatch();
+                            if(Sensorless_FOC_IsEnabled()) {
+                                Sensorless_FOC_ClearFault();
+                            }
+                            Vofa_RequestProtectionClearOk();
+                        }
+                        else {
+                            Vofa_RequestProtectionClearError(protect_cmd);
+                        }
+                    }
+                    start_flag = 0;
+                    rx_cmd_type = 0;
+                    buf_idx = 0;
+                }
+            }
         }
 
-        // 重新挂起下一次单字节接收中断
+        // ???1???????ε????????ж?
         HAL_UART_Receive_IT(&huart3, &g_rx_byte, 1);
     }
 }
