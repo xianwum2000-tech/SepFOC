@@ -210,19 +210,7 @@ float dc_a, dc_b, dc_c;         // 三相输出电压中间值
  * @param  Ua, Ub, Uc: 三相目标电压值
  */
 void setPwm(float Ua, float Ub, float Uc) 
-{
-//    // 1. 计算归一化占空比并限幅 (0.01~0.99 保护死区)
-//    // 这里的除法将电压值转为 0.0 ~ 1.0 的比例
-//    FOC.dc_a = _constrain(Ua / BUS_VOLTAGE, 0.01f, 0.99f);
-//    FOC.dc_b = _constrain(Ub / BUS_VOLTAGE, 0.01f, 0.99f);
-//    FOC.dc_c = _constrain(Uc / BUS_VOLTAGE, 0.01f, 0.99f);
-//	
-//    __disable_irq();
-//    __HAL_TIM_SET_COMPARE(&Pwm_Control_Timer, TIM_CHANNEL_1, (uint32_t)(FOC.dc_a * Pwm_Control_Timer.Instance->ARR)); // HAL库的PWM占空比设置宏(修改定时器捕获比较寄存器（CCR）)
-//    __HAL_TIM_SET_COMPARE(&Pwm_Control_Timer, TIM_CHANNEL_2, (uint32_t)(FOC.dc_b * Pwm_Control_Timer.Instance->ARR));
-//    __HAL_TIM_SET_COMPARE(&Pwm_Control_Timer, TIM_CHANNEL_3, (uint32_t)(FOC.dc_c * Pwm_Control_Timer.Instance->ARR));
-//    __enable_irq();
-	
+{	
     // 1. 计算归一化占空比并限幅 (0.01~0.99 保护死区)
     // 这里的除法将电压值转为 0.0 ~ 1.0 的比例
     FOC.dc_a = _constrain(Ua / BUS_VOLTAGE, 0.01f, 0.99f);

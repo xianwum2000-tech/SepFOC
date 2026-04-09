@@ -43,7 +43,7 @@
 #define SENSORLESS_TRANSITION_MAX_SPEED_RATIO  1.80f
 #define SENSORLESS_TRANSITION_USABLE_MIN_SPEED_RATIO  0.20f
 #define SENSORLESS_TRANSITION_USABLE_MAX_SPEED_RATIO  2.60f
-
+    
 /* SMO + PLL 参数，先给一套偏保守的默认值，后面可以按实机继续调。 */
 #define SENSORLESS_RS                          5.1f
 #define SENSORLESS_LS                          0.0028f
